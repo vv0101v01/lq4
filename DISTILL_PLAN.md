@@ -353,6 +353,36 @@ L2 已經係「精確」的，L3 係用速度換精度，**必須明確標示換
 > 我喺呢個函數上繞咗三轉（其中一次係因為檔案有**兩個** `distill_kl` 定義，
 > 我改嘅係被覆蓋嘅死代碼）。最終靠「全 k × 全 T 都要 = 0」的表格測試鎖死。
 
+### 8.5 除錯 / 去重 / 減債（2026-11-25 第二輪）
+
+**刪除**：`train_step.py`、`cache_stream.py`、`cache_train.py` —— 合共 787 行，
+全屬孤兒（冇任何模組 import）。同時移除 `train_distill` 內已死的 `cache_shard`、
+`topk_target`、`sparse_kl` wrapper 同 `distill_loss`/`topk_decode` import。
+
+**補測試**：`bytes_vocab`、`fuse`、`graph`、`probe`、`teacher` 原本**完全冇測試入口**。
+現時 14 個 suite（11 個模組 selftest + 3 個檔案測試）全部納入 `run_tests.py`。
+
+#### 補測試過程中捉到嘅 5 個真 bug
+
+| # | 模組 | bug | 後果 |
+|---|---|---|---|
+| 1 | `teacher` | 特殊 token（`<eos>`）被當成表面文字 | 每個特殊 token 加 5 bytes，之後所有對齊位置全錯 |
+| 2 | `graph` | `diffuse()` 對 1-D 輸入 crash（`axis=1`）| app 傳 1-D 屬性向量 → 一定爆 |
+| 3 | `graph` | `kuramoto()` 自然頻率均值非零（實測 +0.607）| 相位永遠繞圈，強耦合永遠唔同步 |
+| 4 | `probe` | `verdict()` 有 `fused` 就完全忽略 `per_model` | 最差 teacher 的地板被隱藏 |
+| 5 | `targets` | `distill_kl` 三個疊 bug（見 §8.4）| 完美學生 49 nats |
+
+> 5 個 bug 全部係「寫測試時發現」，唔係「睇代碼時想到」。
+> 有 4 次係我**測試寫錯**（誤解 API 語義），修正測試而非改代碼 ——
+> 例如 `diffuse` 回傳 per-step dispersion 而唔係最終狀態、
+> `kuramoto` 回傳 order parameter 而唔係相位、`token_to_bytes('é')` 係 1 byte 唔係 2。
+> 呢啲誤解本身證明咗 API 唔夠清楚，已補 docstring。
+
+#### CI
+
+`vv0101v01/lq4` · GitHub Actions **全綠**（Python 3.10 + 3.12 + hygiene job）。
+Hygiene job 會在以下情況**失敗**：提交咗 token、有孤兒模組、有 selftest 未註冊。
+
 ### 下一步（我建議次序）
 1. 你去 Space → Diagnostics → **「Measure」**（一粒掣，~5 秒）→ 貼返個表俾我，我即刻定 k 同儲存方案；
 2. 我準備 `dataset.py`（資料 schema + 去重 + licence 欄位）+ 500 條 L2 基準；

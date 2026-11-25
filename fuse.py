@@ -67,9 +67,20 @@ def _balanced_after_boxed(text: str) -> bool:
 
 
 class FusionEngine:
-    def __init__(self, specs: list[ModelSpec], dtype=torch.bfloat16, device: str = "cuda", log=print):
+    def __init__(self, specs: list[ModelSpec], dtype=torch.bfloat16, device: str | None = None, log=print):
+        # Never hard-code cuda: a ZeroGPU restart can land on a CPU-only worker and
+        # then every load fails with "Found no NVIDIA driver", which surfaces only as
+        # "models failed to load".  Falling back keeps the Diagnostics tab truthful.
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            log(f"⚠️ {device} requested but no GPU is visible — using cpu")
+            device = "cpu"
         self.specs = {s.name: s for s in specs}
         self.order = [s.name for s in specs]
+        if device == "cpu" and dtype in (torch.bfloat16, torch.float16):
+            log("⚠️ CPU cannot run bf16/fp16 kernels reliably — using float32")
+            dtype = torch.float32
         self.tok = {}
         self.model = {}
         self.stops = {}

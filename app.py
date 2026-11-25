@@ -154,11 +154,15 @@ _patch_lfm()
 def _load_engine():
     t0 = time.perf_counter()
     try:
-        eng = FusionEngine(SPECS, dtype=DTYPE, device="cuda", log=LOAD_LOG.append)
+        eng = FusionEngine(SPECS, dtype=DTYPE, log=LOAD_LOG.append)   # device inferred
         LOAD_LOG.append(f"✅ spine: |V| = {len(eng.spine):,} shared tokens over {len(eng.names)} generators ({time.perf_counter() - t0:.0f}s)")
         return eng
     except Exception as e:
         LOAD_LOG.append(f"❌ fusion engine: {type(e).__name__}: {e}")
+        if "NVIDIA driver" in str(e) or not torch.cuda.is_available():
+            LOAD_LOG.append("⚠️ this worker has **no GPU**: ZeroGPU gives a T4 only while the "
+                            "Space holds quota. Reload the page / retry later; the fusion "
+                            "tabs need it, the Diagnostics numbers do not.")
         traceback.print_exc()
         return None
 
