@@ -839,11 +839,20 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
         raise
     finally:
         # Unconditional: the next chunk must start from the same VRAM state whether
-        # this one succeeded or not (the failure used to cascade 322 -> 12 MiB).
-        for _n in ("student", "opt"):
-            if _n in locals():
-                locals()[_n] = None
+        # this one succeeded or not.  Measured on the live Space: `empty_cache()`
+        # alone leaves pytorch at 14.95 GB out of 15.83 GB reserved even though a
+        # fresh call reports 10.08 GB free, so the caching allocator is not giving
+        # blocks back to the driver.  release_all() is the documented way to drop
+        # them for real, and it costs one allocator rebuild per chunk.
         student = opt = None
+        hist = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        try:
+            torch.cuda.memory._release_all_cached_memory()   # torch >= 2.7
+        except Exception:
+            pass
         gc.collect()
         torch.cuda.empty_cache()
         LOAD_LOG.append(f"🧹 after train: {_vram_report()}")
