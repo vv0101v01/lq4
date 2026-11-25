@@ -831,12 +831,19 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
             k=k, T=2.0, lr=lr, bs=1, max_len=max_len, out_dir=CKPT_DIR, save_every=1,
             log=lambda m: LOAD_LOG.append(m),
         )
+    except BaseException:
+        # An exception raised inside the training loop keeps every frame of that loop
+        # alive through the traceback, so `del student` there releases nothing and the
+        # device stays at 14.73 GB (measured: it did).  Leaving the except block with
+        # `raise` clears the frames — the free below then actually returns memory.
+        raise
     finally:
-        # A failed step used to leave its activations and grads on the device; the
-        # next call then started with less VRAM and the failure cascaded
-        # (322 -> 284 -> 230 -> 112 -> 86 -> 12 MiB free).  Drop the student and
-        # its optimizer unconditionally so every call starts from the same state.
-        del student, opt
+        # Unconditional: the next chunk must start from the same VRAM state whether
+        # this one succeeded or not (the failure used to cascade 322 -> 12 MiB).
+        for _n in ("student", "opt"):
+            if _n in locals():
+                locals()[_n] = None
+        student = opt = None
         gc.collect()
         torch.cuda.empty_cache()
         LOAD_LOG.append(f"🧹 after train: {_vram_report()}")

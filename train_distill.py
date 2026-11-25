@@ -216,13 +216,18 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
             if not pairs:
                 continue
             out = student(input_ids=ids, attention_mask=enc.get("attention_mask"), use_cache=False)
-            logits = out.logits[0]                            # (L, V_student)
-            si = torch.tensor([p[0] for p in pairs], device=logits.device)
-            tj = torch.tensor([p[1] for p in pairs], device=logits.device)
+            si = torch.tensor([p[0] for p in pairs], device=out.logits.device)
+            tj = torch.tensor([p[1] for p in pairs], device=out.logits.device)
+            # Keep only the aligned positions BEFORE touching autograd.  Slicing after
+            # the graph is built kept the whole (L=384, 248k) logits tensor alive for
+            # backward; measured 7.5 GB of activations on a 14.74 GiB card, which is
+            # what actually OOMed — the teachers only account for 5.4 GB.
+            logits = out.logits[0][si]                        # (n, V_student) — grad kept
+            del out
             tgt = torch.from_numpy(fused[b]).to(logits.device)[tj]   # (n, |V|) log-probs
             ki, kv, tail = build_T_target(tgt, k=min(k, tgt.shape[-1]), T=T)
             spine_ids = torch.as_tensor(_spine_ids(teachers), dtype=torch.long, device=logits.device)
-            loss_terms.append(distill_kl(logits[si], ki, kv, spine_ids, T=T))
+            loss_terms.append(distill_kl(logits, ki, kv, spine_ids, T=T))
             npos += len(pairs)
         if not loss_terms:
             log(f"step {step}: no aligned positions, skipped")
