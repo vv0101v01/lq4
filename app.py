@@ -175,6 +175,34 @@ def _load_engine():
         return None
 
 
+# ---------------------------------------------------------------------------------
+# The student used to be rebuilt on every /distill_step call: 1.6 GB of weights plus
+# its optimizer.  Gradio holds the frame of a failed call (so the traceback stays
+# printable), which kept every one of those students alive — measured: 14.95 GB
+# allocated after six chunks on a 14.74 GiB card, and a fresh call then OOMs inside
+# build_student with 2 MiB free.  Build it ONCE per worker and reuse it.
+# ---------------------------------------------------------------------------------
+STUDENT: dict = {"tok": None, "model": None, "opt": None, "keep": None, "step": 0}
+
+
+def _get_student(keep: list[str], lr: float):
+    """The one student for this worker.  Rebuilds only if the teacher set changed."""
+    import train_distill as TD
+
+    if STUDENT["model"] is not None and STUDENT["keep"] == keep:
+        return STUDENT["tok"], STUDENT["model"], STUDENT["opt"]
+    # a different (or first) teacher set: drop the old student before making a new one
+    STUDENT.update(tok=None, model=None, opt=None, keep=None)
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    tok, model = TD.build_student("Qwen/Qwen3.5-0.8B", "2fc0636", dtype=torch.bfloat16,
+                                  device=str(ENGINE.device), log=lambda m: LOAD_LOG.append(m))
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
+    STUDENT.update(tok=tok, model=model, opt=opt, keep=list(keep))
+    return tok, model, opt
+
+
 def _teacher_stack(keep: list[str]):
     """A TeacherStack over the teachers that survived `_select_teachers`.
 
@@ -813,16 +841,19 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
         LOAD_LOG.append(f"♻️ evicted {evicted} → {_vram_free_gb():.1f} GB free")
     teachers = _teacher_stack(keep)   # rebuild after eviction (models dict is a copy)
     s_tok = ENGINE.tok[keep[0]]
-    student_tok, student = TD.build_student("Qwen/Qwen3.5-0.8B", "2fc0636", dtype=torch.bfloat16,
-                                            device=str(ENGINE.device), log=lambda m: LOAD_LOG.append(m))
-    opt = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad], lr=lr)
+    student_tok, student, opt = _get_student(keep, lr)
+    for g in opt.param_groups:
+        g["lr"] = lr
     ck = TD.latest_ckpt(CKPT_DIR)
     resumed_from = None
-    if ck and not fresh:
+    if ck and not fresh and STUDENT["step"] == 0:
         st, _ = TD.load_ckpt(ck, student, opt)
+        STUDENT["step"] = st
         DISTILL_STATE["step"] = max(DISTILL_STATE["step"], st)
         resumed_from = f"{os.path.basename(ck)} @ step {st}"
         LOAD_LOG.append(f"↩️ resumed {resumed_from}")
+    elif STUDENT["step"]:
+        resumed_from = f"in-memory @ step {STUDENT['step']} (checkpoint {os.path.basename(ck) if ck else '-'})"
 
     LOAD_LOG.append(f"📊 budget before train: {_vram_report()}")
     try:
@@ -838,21 +869,13 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
         # `raise` clears the frames — the free below then actually returns memory.
         raise
     finally:
-        # Unconditional: the next chunk must start from the same VRAM state whether
-        # this one succeeded or not.  Measured on the live Space: `empty_cache()`
-        # alone leaves pytorch at 14.95 GB out of 15.83 GB reserved even though a
-        # fresh call reports 10.08 GB free, so the caching allocator is not giving
-        # blocks back to the driver.  release_all() is the documented way to drop
-        # them for real, and it costs one allocator rebuild per chunk.
-        student = opt = None
+        # The student is cached for the worker's lifetime, so there is nothing to free
+        # here — only the per-chunk activations, which the allocator reuses anyway.
+        # `hist` is deliberately dropped: it is copied into DISTILL_STATE and keeping
+        # the training loop's frame reachable is what used to pin the whole step.
+        if STUDENT["model"] is student:
+            STUDENT["step"] = DISTILL_STATE["step"]
         hist = None
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        try:
-            torch.cuda.memory._release_all_cached_memory()   # torch >= 2.7
-        except Exception:
-            pass
         gc.collect()
         torch.cuda.empty_cache()
         LOAD_LOG.append(f"🧹 after train: {_vram_report()}")
@@ -1010,13 +1033,12 @@ def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 5
     if not batch:
         raise gr.Error("offset past the end of the test split")
 
-    student_tok, student = TD.build_student("Qwen/Qwen3.5-0.8B", "2fc0636", dtype=torch.bfloat16,
-                                            device=str(next(iter(teachers.model.values())).device),
-                                            log=lambda m: LOAD_LOG.append(m))
-    opt = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad], lr=1e-4)
+    # reuse the worker's student: building a second one costs 1.6 GB and the first
+    # stays alive through this frame, which is how this path used to OOM
+    student_tok, student, opt = _get_student(keep, 1e-4)
     ck = TD.latest_ckpt(CKPT_DIR)
-    ck_step = 0
-    if ck:
+    ck_step = STUDENT["step"]
+    if ck and ck_step == 0:
         ck_step, _ = TD.load_ckpt(ck, student, opt)
     student.eval()
 
