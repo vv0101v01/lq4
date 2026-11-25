@@ -851,7 +851,10 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
     DISTILL_STATE["step"] += len(hist)
     DISTILL_STATE["positions"] += sum(n for _, _, n in hist)
 
-    h = DISTILL_STATE["history"]
+    # `history` accumulates for the life of the worker, so reporting its head as
+    # "first" printed the same 26.8133 for every chunk ever after — a display bug that
+    # looked exactly like "the checkpoint is not loading".  Report THIS chunk only.
+    h = DISTILL_STATE["history"][-len(hist):] if (hist := locals().get("hist")) else []
     dt = time.perf_counter() - t0
     md = [f"### L3 distillation · chunk of {steps} steps in {dt:.0f}s",
           f"- loss code: `targets.distill_kl` (support chosen at T=1, T^2 scaling)",
