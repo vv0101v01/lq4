@@ -28,7 +28,9 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch
 
       - name: Install the rest
-        run: pip install "transformers==5.15.1" numpy pandas matplotlib peft spaces
+        # gradio is needed because tests/test_counts.py imports app.py to compare the
+        # numbers the UI prints against the ones the code computes
+        run: pip install "transformers==5.15.1" numpy pandas matplotlib peft spaces gradio
 
       - name: Byte table (works with no torch at all)
         run: python bytes_vocab.py
