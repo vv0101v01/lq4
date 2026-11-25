@@ -189,6 +189,18 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
     # chunks cover new problems; `--seed` still pins it for a reproducible run.
     order = np.random.default_rng(start_step % 10_000 + 1).permutation(len(rows))
     for step in range(start_step, start_step + steps):
+        # Long rows (p99 is ~1.8k tokens, the cap is 1024) need far more transient VRAM
+        # than the 7.6 GB of headroom a t4-small leaves once teachers + student are
+        # resident.  Stop the chunk cleanly instead of letting the step raise: a
+        # half-finished chunk still saved every step (save_every=1), and the caller can
+        # simply run the next one.
+        try:
+            free_gb = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 1e9
+        except Exception:
+            free_gb = 1e9
+        if free_gb < 2.0:
+            log(f"step {step}: only {free_gb:.2f} GB free — ending this chunk early")
+            break
         batch_rows = [rows[i] for i in order[step % len(order):(step % len(order)) + bs]]
         if len(batch_rows) < bs:  # wrap
             batch_rows += [rows[i] for i in order[: bs - len(batch_rows)]]
