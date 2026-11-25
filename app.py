@@ -785,18 +785,39 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
     return "\n".join(md)
 
 
+def _ckpt_facts() -> dict:
+    """What the persistent volume actually holds — the only durable source of truth."""
+    import torch as _t
+
+    files = sorted(glob.glob(os.path.join(CKPT_DIR, "step_*.pt")),
+                   key=lambda p: int(os.path.basename(p)[5:-3]))
+    if not files:
+        return {"steps": 0, "files": 0, "dir": CKPT_DIR}
+    last = files[-1]
+    try:
+        sd = _t.load(last, map_location="cpu", weights_only=False)
+        meta = sd.get("meta", {})
+        return {"steps": int(sd.get("step", 0)), "files": len(files), "dir": CKPT_DIR,
+                "k": meta.get("k"), "T": meta.get("T"), "lr": meta.get("lr"), "rows": meta.get("n")}
+    except Exception as e:
+        return {"steps": int(os.path.basename(last)[5:-3]), "files": len(files), "dir": CKPT_DIR,
+                "error": f"{type(e).__name__}: {e}"}
+
+
 def distill_md():
+    f = _ckpt_facts()
     h = DISTILL_STATE["history"]
     if not h:
         return ("### L3 distillation\n\nNot started. The plan needs ~7.2 A100-h at k=256 for the full "
                 "20 k-sequence run; each click of *Run chunk* trains a few steps and checkpoints.")
     losses = [l for _, l, _ in h]
     el = time.time() - (DISTILL_STATE["started"] or time.time())
-    return (f"### L3 distillation · {DISTILL_STATE['step']} steps\n\n"
-            f"- positions seen: **{DISTILL_STATE['positions']:,}**\n"
-            f"- loss **{losses[0]:.4f} → {losses[-1]:.4f}** (min {min(losses):.4f})\n"
-            f"- wall clock {el / 60:.1f} min\n"
-            f"- targets: k=256 (floor 0.030 nats, §8.1)")
+    return (f"### L3 distillation\n\n"
+            f"- **{f['steps']} steps on disk** (`{f['dir']}`, {f['files']} checkpoints)\n"
+            f"- this process: {len(h)} steps in {el / 60:.1f} min · "
+            f"loss {losses[0]:.3f} → {losses[-1]:.3f} (min {min(losses):.3f})\n"
+            f"- targets: k={f.get('k') or 256} · T={f.get('T')}\n\n"
+            f"> counts on disk survive restarts; the in-process numbers reset with the worker")
 
 
 def diagnostics_md():
