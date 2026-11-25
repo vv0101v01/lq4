@@ -205,8 +205,12 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
         for b, r in enumerate(batch_rows):
             text = _prompt_of(r) + _solution_of(r)
             dev = next(student.parameters()).device
+            # Truncate exactly like the teachers were (max_len), or the student's LM
+            # head builds a graph over every position of a 3 kB solution: (L, 248k)
+            # bf16 logits + a float32 lm_head backward buffer.  Measured on t4-small:
+            # 8.25 GB free before the step, 14.41 GB allocated after -> OOM.
             enc = student_tok(text, return_tensors="pt", return_offsets_mapping=True,
-                              add_special_tokens=False)
+                              add_special_tokens=False, truncation=True, max_length=max_len)
             ids = enc["input_ids"].to(dev)
             if enc.get("attention_mask") is not None:
                 enc["attention_mask"] = enc["attention_mask"].to(dev)
