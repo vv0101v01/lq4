@@ -718,31 +718,9 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
     # the teachers *not* selected are evicted from the engine (they are re-loadable
     # from the Hub).  Measured: creating the student with all four resident dies with
     # `CUDA out of memory ... 14.74 GiB ... 2.12 MiB free`.
-    names = [n for n in ENGINE.order if n in ENGINE.model]
-    want = max(2, min(int(teachers_n), len(names)))     # fused target needs >= 2 teachers
-    keep = names[:want]
-    evicted = [n for n in names if n not in keep]
-    for n in evicted:
-        ENGINE.model.pop(n, None)
-        ENGINE.tok.pop(n, None)
-        ENGINE.stops.pop(n, None)
+    keep, evicted = _select_teachers(ENGINE, teachers_n)
     if evicted:
-        gc.collect()
-        torch.cuda.empty_cache()
-        LOAD_LOG.append(f"♻️ evicted teachers {evicted} to free VRAM for the student")
-    ENGINE.names = keep
-    teachers = TeacherStack.__new__(TeacherStack)
-    teachers.specs, teachers.order = ENGINE.specs, keep
-    teachers.tok = {n: ENGINE.tok[n] for n in keep}
-    teachers.model = {n: ENGINE.model[n] for n in keep}
-    teachers.stops = {n: ENGINE.stops[n] for n in keep}
-    teachers.names = keep
-    teachers.spine = ENGINE.spine
-    teachers.dtype, teachers.device = ENGINE.dtype, ENGINE.device
-    import teacher as _t
-
-    _t._TOK_OF.update(ENGINE.tok)
-
+        LOAD_LOG.append(f"♻️ evicted {evicted} → {_vram_free_gb():.1f} GB free")
     s_tok = ENGINE.tok[keep[0]]
     student_tok, student = TD.build_student("Qwen/Qwen3.5-0.8B", "2fc0636", dtype=torch.bfloat16,
                                             device=str(ENGINE.device), log=lambda m: LOAD_LOG.append(m))
@@ -804,6 +782,43 @@ def _ckpt_facts() -> dict:
                 "error": f"{type(e).__name__}: {e}"}
 
 
+def _select_teachers(engine, want: int):
+    """Keep `want` teachers resident and actually free the rest.
+
+    `dict.pop` alone is not enough: the module stays alive through autograd hooks
+    and the accelerator's device map, so VRAM is not returned and the next
+    `from_pretrained` dies with "14.74 GiB in use ... 2.12 MiB free" (measured
+    twice on t4-small).  Moving to the meta device releases the real storage.
+    """
+    import gc
+
+    names = [n for n in engine.order if n in engine.model]
+    want = max(2, min(int(want), len(names)))
+    keep = names[:want]
+    evicted = [n for n in names if n not in keep]
+    for n in evicted:
+        m = engine.model.pop(n, None)
+        engine.tok.pop(n, None)
+        engine.stops.pop(n, None)
+        if m is not None:
+            try:
+                m.to("meta")
+            except Exception:
+                pass
+            del m
+    if evicted:
+        gc.collect()
+        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    engine.names = keep
+    return keep, evicted
+
+
+def _vram_free_gb() -> float:
+    return torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0.0
+
+
 REPORT_DIR = os.path.join(_PERSIST if os.path.isdir(_PERSIST) else HERE, "reports")
 
 
@@ -826,13 +841,9 @@ def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 5
     t0 = time.perf_counter()
     if ENGINE is None:
         raise gr.Error("models failed to load — see Diagnostics")
-    names = [n_ for n_ in ENGINE.order if n_ in ENGINE.model]
-    want = max(2, min(int(teachers_n), len(names)))
-    keep = names[:want]
-    for n_ in [x for x in names if x not in keep]:
-        ENGINE.model.pop(n_, None); ENGINE.tok.pop(n_, None); ENGINE.stops.pop(n_, None)
-    gc.collect(); torch.cuda.empty_cache()
-    ENGINE.names = keep
+    keep, evicted = _select_teachers(ENGINE, teachers_n)
+    if evicted:
+        LOAD_LOG.append(f"♻️ evicted {evicted} → {_vram_free_gb():.1f} GB free")
 
     from teacher import TeacherStack, shared_offsets
     import teacher as _t
