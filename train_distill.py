@@ -189,7 +189,7 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
         if len(batch_rows) < bs:  # wrap
             batch_rows += [rows[i] for i in order[: bs - len(batch_rows)]]
         fb = teachers.logits([_prompt_of(r) + _solution_of(r) for r in batch_rows], max_len)
-        fused = teachers.fused_target(fb, weights)          # (B, P, |V|)
+        fused = teachers.fused_target(fb, weights, ragged=True)   # list of (P_b, |V|)
         offs = _shared_offsets(teachers, fb, weights)
 
         loss_terms, npos = [], 0

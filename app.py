@@ -804,6 +804,144 @@ def _ckpt_facts() -> dict:
                 "error": f"{type(e).__name__}: {e}"}
 
 
+REPORT_DIR = os.path.join(_PERSIST if os.path.isdir(_PERSIST) else HERE, "reports")
+
+
+@spaces.GPU(duration=240)
+def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 512,
+                     teachers_n: int = 2, offset_test: bool = True):
+    """Measure the distilled student against the fused teacher — the §6 gates.
+
+    Computes, on held-out MATH **test** rows (never seen in training):
+      * KL(q_fused || p_student) on the stored support   (gate: < 0.35 nats)
+      * top-1 agreement with the fused argmax            (gate: >= 70 %)
+      * truncation floor for reference                   (k=256: 0.030 nats)
+    Nothing here looks at L2 task accuracy; that needs generation and is separate.
+    """
+    import gc
+
+    import train_distill as TD
+    from targets import build_T_target, distill_kl
+
+    t0 = time.perf_counter()
+    if ENGINE is None:
+        raise gr.Error("models failed to load — see Diagnostics")
+    names = [n_ for n_ in ENGINE.order if n_ in ENGINE.model]
+    want = max(2, min(int(teachers_n), len(names)))
+    keep = names[:want]
+    for n_ in [x for x in names if x not in keep]:
+        ENGINE.model.pop(n_, None); ENGINE.tok.pop(n_, None); ENGINE.stops.pop(n_, None)
+    gc.collect(); torch.cuda.empty_cache()
+    ENGINE.names = keep
+
+    from teacher import TeacherStack, shared_offsets
+    import teacher as _t
+
+    teachers = TeacherStack.__new__(TeacherStack)
+    teachers.specs, teachers.order = ENGINE.specs, keep
+    teachers.tok = {n_: ENGINE.tok[n_] for n_ in keep}
+    teachers.model = {n_: ENGINE.model[n_] for n_ in keep}
+    teachers.stops = {n_: ENGINE.stops[n_] for n_ in keep}
+    teachers.names, teachers.spine = keep, ENGINE.spine
+    teachers.dtype, teachers.device = ENGINE.dtype, ENGINE.device
+    _t._TOK_OF.update(ENGINE.tok)
+
+    rows = corpus_rows(TEST_PATH) if offset_test else corpus_rows()
+    lo = max(0, int(offset))
+    batch = rows[lo:lo + int(n)]
+    if not batch:
+        raise gr.Error("offset past the end of the test split")
+
+    student_tok, student = TD.build_student("Qwen/Qwen3.5-0.8B", "2fc0636", dtype=torch.bfloat16,
+                                            device=str(next(iter(teachers.model.values())).device),
+                                            log=lambda m: LOAD_LOG.append(m))
+    opt = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad], lr=1e-4)
+    ck = TD.latest_ckpt(CKPT_DIR)
+    ck_step = 0
+    if ck:
+        ck_step, _ = TD.load_ckpt(ck, student, opt)
+    student.eval()
+
+    spine_ids = torch.as_tensor(TD._spine_ids(teachers), dtype=torch.long).cuda()
+    texts = [r["problem"] + TD.PROMPT_SUFFIX + r["solution"] for r in batch]
+    fb = teachers.logits(texts, max_len=max_len)
+    fused = teachers.fused_target(fb, {n_: 1.0 for n_ in keep}, ragged=True)
+    offs = shared_offsets(fb, {n_: 1.0 for n_ in keep})
+
+    dev = next(student.parameters()).device
+    total_pos = 0
+    kl_sum = 0.0
+    agree = 0
+    floors = []
+    per_row = []
+    for b, r in enumerate(batch):
+        enc = student_tok(texts[b], return_tensors="pt", add_special_tokens=False)
+        ids = enc["input_ids"].to(dev)
+        so = _t._char_offsets(student_tok, ids[0].cpu())
+        m = {o: i for i, o in enumerate(so)}
+        pairs = [(m[o] - 1, j) for j, o in enumerate(offs[b]) if o in m and m[o] - 1 >= 0]
+        if not pairs:
+            per_row.append({"subject": r["subject"], "positions": 0, "kl": None, "top1": None})
+            continue
+        with torch.no_grad():
+            logits = student(input_ids=ids,
+                             attention_mask=enc.get("attention_mask", torch.ones_like(ids)).to(dev),
+                             use_cache=False).logits[0]
+        si = torch.as_tensor([p[0] for p in pairs], device=dev)
+        tj = torch.as_tensor([p[1] for p in pairs], device=dev)
+        tgt = torch.from_numpy(fused[b]).to(dev)[tj]                    # (n, |V|) log-probs
+        ki, kv, tail = build_T_target(tgt, k=min(k, tgt.shape[-1]), T=1.0)
+        with torch.no_grad():
+            kl = distill_kl(logits[si], ki, kv, spine_ids, T=1.0)
+            # top-1 agreement on the student's *own* vocabulary vs the fused argmax
+            fused_top = ki.gather(-1, kv.argmax(-1, keepdim=True)).squeeze(-1)   # spine idx
+            stu_top_spine = logits[si].index_select(-1, spine_ids).argmax(-1)
+            a = int((fused_top == stu_top_spine).sum())
+        total_pos += len(pairs)
+        kl_sum += float(kl.sum())
+        agree += a
+        floors.append(float(tail.mean()))
+        per_row.append({"subject": r["subject"], "positions": len(pairs),
+                        "kl": round(float(kl.mean()), 4), "top1": round(a / len(pairs), 3)})
+
+    del student, opt
+    gc.collect(); torch.cuda.empty_cache()
+
+    if total_pos == 0:
+        raise gr.Error("no aligned positions in this batch")
+    kl_mean = kl_sum / total_pos
+    agree_pct = 100.0 * agree / total_pos
+    floor = sum(floors) / len(floors)
+    dt = time.perf_counter() - t0
+
+    def gate(name, value, ok):
+        return f"| {name} | {value} | {'✅ PASS' if ok else '❌ FAIL'} |"
+
+    md = [f"### L3 evaluation · {len(batch)} held-out MATH problems ({dt:.0f}s)",
+          f"checkpoint **step {ck_step}** (`{os.path.basename(ck) if ck else 'none'}`) · "
+          f"{total_pos:,} aligned positions · k={k}",
+          "",
+          "| gate | value | |",
+          "|---|---|---|",
+          gate("KL(student ‖ fused)", f"{kl_mean:.4f} nats", kl_mean < 0.35),
+          gate("top-1 agreement", f"{agree_pct:.1f} %", agree_pct >= 70.0),
+          gate("truncation floor (reference)", f"{floor:.4f} nats", floor < 0.01),
+          "",
+          f"> §6 gates: KL < 0.35 nats, top-1 ≥ 70 %. The student is compared to the "
+          f"**fused** law (the thing it is trained on), not to any single teacher.",
+          ""]
+    out = {f"eval_step{ck_step}": {"kl": kl_mean, "top1": agree_pct, "positions": total_pos,
+                                   "floor": floor, "rows": len(batch)}}
+    try:
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        with open(os.path.join(REPORT_DIR, f"eval_step{ck_step}.json"), "w") as f:
+            json.dump(out, f, indent=1)
+        md.append(f"saved to `{REPORT_DIR}/eval_step{ck_step}.json`")
+    except Exception as e:
+        md.append(f"(could not save report: {type(e).__name__})")
+    return "\n".join(md), pd.DataFrame(per_row)
+
+
 def distill_md():
     f = _ckpt_facts()
     h = DISTILL_STATE["history"]
@@ -995,6 +1133,14 @@ with gr.Blocks(title="6in1") as demo:
                 ds_btn = gr.Button("Run chunk", variant="primary")
                 ds_ref = gr.Button("Refresh status")
             ds_out = gr.Markdown(distill_md())
+            gr.Markdown("#### Evaluate the student against the fused teacher (§6 gates)")
+            with gr.Row():
+                ev_n = gr.Slider(2, 24, value=8, step=1, label="held-out problems")
+                ev_off = gr.Slider(0, 4900, value=0, step=1, label="offset in test split")
+                ev_btn = gr.Button("Evaluate", variant="secondary")
+            ev_md = gr.Markdown()
+            ev_df = gr.Dataframe(label="per problem")
+            ev_btn.click(evaluate_student, [ev_n, ev_off], [ev_md, ev_df])
             ds_btn.click(distill_step, [ds_steps, ds_k, ds_lr, ds_max, ds_lim, ds_fresh, ds_tn], ds_out)
             ds_ref.click(distill_md, [], ds_out)
 

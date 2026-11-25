@@ -187,15 +187,17 @@ def shared_boundaries(ends_a: list[int], ends_b: list[int]) -> list[tuple[int, i
 
 
 def fused_target(batch: TeacherBatch, spine, weights: dict[str, float], rule: str = "product (log-linear)",
-                 tok_of: dict | None = None, log=print) -> np.ndarray:
+                 tok_of: dict | None = None, log=print, ragged: bool = False):
     """Fuse teachers at every position where **all** their token boundaries coincide.
 
     batch.ids are each teacher's own ids; `tok_of` supplies the tokenizer needed to
     compute surface byte offsets (defaults to spine.vocabs if present).
 
-    Returns (B, P, |V|) where P = number of byte-aligned positions (<= L).  Positions
-    are the informative ones: everywhere a token boundary is shared, the "next token"
-    is the same unit of text for every teacher.
+    Returns (B, P, |V|) **only when every row has the same number of aligned
+    positions**.  Rows differ in length, so batching distinct texts makes that
+    rarely true — pass `ragged=True` for the general case, which returns a list of
+    (P_b, |V|) arrays.  (Measured: stacking without this raised
+    "all input arrays must have the same shape" on the very first evaluation run.)
     """
     from bytes_vocab import token_to_bytes
 
@@ -227,7 +229,14 @@ def fused_target(batch: TeacherBatch, spine, weights: dict[str, float], rule: st
             z = fuse(row, [weights[n] for n in names], rule)[:V]
             pos.append(z - np.logaddexp.reduce(z))
         per_batch.append(np.stack(pos))
-    return np.stack(per_batch)  # (B, P, V)
+    lens = {p.shape[0] for p in per_batch}
+    if len(lens) == 1:
+        return np.stack(per_batch)              # (B, P, V) — the aligned case
+    if ragged:
+        return per_batch                        # list of (P_b, V)
+    raise ValueError(
+        f"rows have different numbers of aligned positions {sorted(lens)}; "
+        f"pass ragged=True for a list of (P_b, V) arrays")
 
 
 def _char_offsets(tok, ids: torch.Tensor) -> list[int]:
