@@ -967,49 +967,86 @@ def _vram_report() -> str:
 REPORT_DIR = os.path.join(_PERSIST if os.path.isdir(_PERSIST) else HERE, "reports")
 
 
-@spaces.GPU(duration=120)
-def fft_ring_bench(n_list="8,16,32,64,128", steps=200, batch=64, reps=20):
-    """Real T4 numbers for FFT cyclic convolution vs the matmul it replaces.
+@spaces.GPU(duration=180)
+def fft_ring_bench(steps: int = 200, batch: int = 64, reps: int = 20):
+    """Real GPU numbers: FFT cyclic convolution vs the matmul it replaces.
 
-    The convolution has no CPU caller in production, so a CPU measurement answers a
-    question nobody asked; this endpoint is the one that does.  It reports the device
-    it actually ran on, so a fallback can never be read as an acceleration.
+    The convolution has no production CPU caller, so a CPU measurement answers a
+    question nobody asked — this runs on the Space's own GPU.  It reports the device
+    it actually used, so a fallback can never be read as an acceleration.
+
+    Self-contained on purpose: importing the package's own bench module depended on
+    sys.path being set up exactly right, which is a failure mode with no upside.
     """
-    import sys as _sys
+    import torch as T
 
-    pkg = os.environ.get("RING_FFT_PATH", os.path.join(HERE, "..", "fft_ring", "python"))
-    if os.path.abspath(pkg) not in _sys.path:
-        _sys.path.insert(0, os.path.abspath(pkg))
-    try:
-        import ring_fft_gpu as G
-    except Exception as e:
-        return f"❌ ring_fft not available on this worker: {type(e).__name__}: {e}"
+    if not T.cuda.is_available():
+        return ("⚠️ no CUDA device on this worker — CPU numbers answer a different "
+                "question, so none are printed. Retry when the Space holds a GPU.")
+    dev = T.device("cuda")
+    prop = T.cuda.get_device_properties(0)
 
-    import torch as _t
+    def convolve(x, k):
+        # real signal -> rfft: half the spectral work and half the memory
+        xc = T.fft.rfft(x, dim=-1)
+        kc = T.fft.rfft(k, dim=-1)
+        return T.fft.irfft(xc * kc, n=x.shape[-1], dim=-1)
 
-    dev = G.device()
-    if dev.type != "cuda":
-        return ("⚠️ no CUDA device on this worker — the numbers below would be CPU "
-                "numbers, which answer a different question. Not running.")
-    prop = _t.cuda.get_device_properties(0)
+    def measure(n, steps, batch, reps):
+        w = T.zeros(n, n, device=dev)
+        idx = T.arange(n, device=dev)
+        w[idx, (idx + 1) % n] = 1.0
+        w[(idx + 1) % n, idx] = 1.0
+        p = w / w.sum(1, keepdim=True)
+        kernel = p[0]
+        x = T.randn(batch, n, device=dev)
+
+        def run_mm():
+            s = x.clone()
+            for _ in range(steps):
+                s = 0.6 * s + 0.4 * (s @ p.T)
+            return s
+
+        def run_fft():
+            s = x.clone()
+            for _ in range(steps):
+                s = 0.6 * s + 0.4 * convolve(s, kernel)
+            return s
+
+        def timeit(fn):
+            fn(); T.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(reps):
+                fn()
+            T.cuda.synchronize()
+            return (time.perf_counter() - t0) / reps
+
+        a, b = run_mm(), run_fft()
+        return (timeit(run_mm) * 1e3, timeit(run_fft) * 1e3,
+                float((a - b).abs().max()))
+
     md = [f"### FFT cyclic convolution on `{prop.name}` "
-          f"({prop.total_memory / 1e9:.2f} GB, sm_{prop.major}{prop.minor})",
-          "",
+          f"({prop.total_memory / 1e9:.2f} GB, sm_{prop.major}{prop.minor})", "",
           "| N | steps | batch | matmul ms | fft ms | speedup | max abs diff |",
           "|---|---|---|---|---|---|---|"]
-    for ns in str(n_list).split(","):
-        n = int(ns.strip())
-        if n not in (8, 16, 32, 64, 128):
-            continue
-        r = G.bench(n, steps=int(steps), batch=int(batch), reps=int(reps), dev=dev)
-        md.append(f"| {r['n']} | {r['steps']} | {r['batch']} | {r['matmul_ms']:.4f} | "
-                  f"{r['fft_ms']:.4f} | **{r['speedup']:.2f}×** | {r['max_abs_diff']:.1e} |")
-    md += ["", "batch scaling at N=128:", "",
+    for n in (8, 16, 32, 64, 128):
+        tm, tf, d = measure(n, int(steps), int(batch), int(reps))
+        md.append(f"| {n} | {steps} | {batch} | {tm:.4f} | {tf:.4f} | "
+                  f"**{tm / tf:.2f}×** | {d:.1e} |")
+
+    md += ["", f"batch scaling (N=128, steps={steps}):", "",
            "| batch | matmul ms | fft ms | speedup |", "|---|---|---|---|"]
-    for b in (1, 8, 64, 512, 4096):
-        r = G.bench(128, steps=int(steps), batch=b, reps=10, dev=dev)
-        md.append(f"| {b} | {r['matmul_ms']:.4f} | {r['fft_ms']:.4f} | **{r['speedup']:.2f}×** |")
-    md += ["", "> Only the ring graph is circulant. The k-NN graph keeps the matmul."]
+    for b in (8, 64, 512, 2048):
+        tm, tf, _ = measure(128, int(steps), b, 10)
+        md.append(f"| {b} | {tm:.4f} | {tf:.4f} | **{tm / tf:.2f}×** |")
+
+    md += ["", "steps scaling (N=128, batch=64):", "",
+           "| steps | matmul ms | fft ms | speedup |", "|---|---|---|---|"]
+    for st in (50, 200, 800):
+        tm, tf, _ = measure(128, st, int(batch), 10)
+        md.append(f"| {st} | {tm:.4f} | {tf:.4f} | **{tm / tf:.2f}×** |")
+
+    md += ["", "> Only the ring graph is circulant; the k-NN graph keeps the matmul."]
     return "\n".join(md)
 
 
@@ -1348,9 +1385,13 @@ with gr.Blocks(title="6in1") as demo:
             ev_md = gr.Markdown()
             ev_df = gr.Dataframe(label="per problem")
             ev_btn.click(evaluate_student, [ev_n, ev_off], [ev_md, ev_df])
+            with gr.Row():
+                fr_steps = gr.Slider(20, 800, value=200, step=20, label="steps")
+                fr_batch = gr.Slider(1, 2048, value=64, step=1, label="batch (rings)")
+                fr_reps = gr.Slider(5, 50, value=20, step=5, label="reps")
             fr_btn = gr.Button("FFT ring bench (real GPU numbers)", variant="secondary")
             fr_md = gr.Markdown()
-            fr_btn.click(fft_ring_bench, [], [fr_md])
+            fr_btn.click(fft_ring_bench, [fr_steps, fr_batch, fr_reps], [fr_md])
             vd_btn = gr.Button("VRAM diagnostic (what is resident?)", variant="secondary")
             vd_md = gr.Markdown()
             vd_btn.click(vram_diag, [], [vd_md])
