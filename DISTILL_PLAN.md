@@ -408,6 +408,42 @@ Hygiene job 會在以下情況**失敗**：提交咗 token、有孤兒模組、�
 > ⚠️ 注意：loss 數值**唔可以跨版本比較**。bug 2 修正後 loss 尺度和之前不同
 > （之前係 T² 乘一個未歸一化嘅和，偏小）。只可以在同一版本內看趨勢。
 
+### 8.7 評估結果（誠實）：**兩個 §6 門檻都未過**
+
+跑了 366 步之後，在 **MATH test 留出集**（訓練從未見過）上量：
+
+| 門檻 | 要求 | 實測（step 262） | 實測（step 366） |
+|---|---|---|---|
+| KL(student ‖ fused) | < 0.35 nats | **1.385** ❌ | **1.662** ❌ |
+| top-1 agreement | ≥ 70 % | **47.9 %** ❌ | **49.4 %** ❌ |
+| truncation floor | 參考值 | 0.0086 ✅ | 0.0086 ✅ |
+
+**訓練 loss 0.61，但留出集 KL 1.66 —— 呢個係過擬合，唔係「差少少」。**
+
+#### 根因（已定位，未驗證修法）
+
+`train_student` 用 `np.random.default_rng(0)`，而 `limit=40`：
+**每個 chunk 都由同一個排列開始，只看 7 495 條題目中的 40 條（0.53 %）**。
+重啟後 step 由 185 跌返 6，但排列亦重來 —— 學生反覆背同一批題。
+
+已修（待驗證）：
+- 資料走訪改為每 chunk 不同（`rng(start_step)`）
+- 預設抽樣由 40 → **1 200 條**
+- 啟動只載入 2 個 teacher（原先 4 個佔 14.6 / 14.74 GiB，令 student 永遠無法建立）
+
+#### 另外 4 個在長跑中暴露的 bug
+
+| # | bug | 症狀 | 修法 |
+|---|---|---|---|
+| 4 | `fused_target` 對不等長 batch 直接 `np.stack` | `all input arrays must have the same shape` | `ragged=True` 回傳 list |
+| 5 | `TeacherStack.fused_target` 冇轉發 `ragged` | `unexpected keyword argument` | 補上 |
+| 6 | `dict.pop` 唔釋放 VRAM | OOM 但 `14.59 GiB allocated` 不變 | `.to("meta")` |
+| 7 | 4 個 teacher 在 import 時全部載入 | student 永遠無法建立 | 只熱載 2 個，其餘 on-demand |
+
+> 值得記錄：bug 6 我試過「pop + gc + empty_cache」但仍然 OOM，
+> 因為 module 仍被 autograd hook / device map 引用。`.to("meta")` 才真正釋放。
+> bug 7 則是架構問題 —— 唔係「清得唔夠狠」，而係「一開始就唔應該全部載入」。
+
 ### 下一步（我建議次序）
 1. 你去 Space → Diagnostics → **「Measure」**（一粒掣，~5 秒）→ 貼返個表俾我，我即刻定 k 同儲存方案；
 2. 我準備 `dataset.py`（資料 schema + 去重 + licence 欄位）+ 500 條 L2 基準；
