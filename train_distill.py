@@ -192,7 +192,8 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
         batch_rows = [rows[i] for i in order[step % len(order):(step % len(order)) + bs]]
         if len(batch_rows) < bs:  # wrap
             batch_rows += [rows[i] for i in order[: bs - len(batch_rows)]]
-        fb = teachers.logits([_prompt_of(r) + _solution_of(r) for r in batch_rows], max_len)
+        full = [(_prompt_of(r) + _solution_of(r)) for r in batch_rows]
+        fb = teachers.logits(full, max_len)
         # fused_target + offsets only need logits, never gradients.  Left outside
         # inference_mode they keep the whole teacher batch's autograd bookkeeping
         # alive across the student backward, which is invisible in `loss` but shows
@@ -203,7 +204,7 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
 
         loss_terms, npos = [], 0
         for b, r in enumerate(batch_rows):
-            text = _prompt_of(r) + _solution_of(r)
+            text = full[b]
             dev = next(student.parameters()).device
             # Truncate exactly like the teachers were (max_len), or the student's LM
             # head builds a graph over every position of a 3 kB solution: (L, 248k)
@@ -211,6 +212,10 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
             # 8.25 GB free before the step, 14.41 GB allocated after -> OOM.
             enc = student_tok(text, return_tensors="pt", return_offsets_mapping=True,
                               add_special_tokens=False, truncation=True, max_length=max_len)
+            # The truncation above is a HARD safety cap (`max_logits_pos`), not the
+            # context window: a 3 kB solution would otherwise build an LM-head graph
+            # over 3000 positions x 248k vocab and OOM the card.  Keep the cap wide
+            # enough that it rarely binds — measured rows: median 182 tokens.
             ids = enc["input_ids"].to(dev)
             if enc.get("attention_mask") is not None:
                 enc["attention_mask"] = enc["attention_mask"].to(dev)

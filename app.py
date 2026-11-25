@@ -1274,7 +1274,7 @@ with gr.Blocks(title="6in1") as demo:
                 ds_steps = gr.Slider(1, 20, value=4, step=1, label="steps this chunk")
                 ds_k = gr.Dropdown([64, 128, 256], value=256, label="top-k")
                 ds_lr = gr.Slider(1e-5, 5e-4, value=1e-4, step=1e-5, label="learning rate")
-                ds_max = gr.Slider(256, 2048, value=768, step=64, label="max tokens")
+                ds_max = gr.Slider(256, 2048, value=1024, step=64, label="max tokens (hard cap: 1024 很少觸及)")
                 ds_lim = gr.Slider(0, 7500, value=1200, step=50, label="rows to sample from (0 = all)")
                 ds_tn = gr.Slider(2, 4, value=2, step=1, label="teachers used")
                 ds_fresh = gr.Checkbox(value=False, label="restart from scratch")
