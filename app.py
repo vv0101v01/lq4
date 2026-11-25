@@ -967,6 +967,52 @@ def _vram_report() -> str:
 REPORT_DIR = os.path.join(_PERSIST if os.path.isdir(_PERSIST) else HERE, "reports")
 
 
+@spaces.GPU(duration=120)
+def fft_ring_bench(n_list="8,16,32,64,128", steps=200, batch=64, reps=20):
+    """Real T4 numbers for FFT cyclic convolution vs the matmul it replaces.
+
+    The convolution has no CPU caller in production, so a CPU measurement answers a
+    question nobody asked; this endpoint is the one that does.  It reports the device
+    it actually ran on, so a fallback can never be read as an acceleration.
+    """
+    import sys as _sys
+
+    pkg = os.environ.get("RING_FFT_PATH", os.path.join(HERE, "..", "fft_ring", "python"))
+    if os.path.abspath(pkg) not in _sys.path:
+        _sys.path.insert(0, os.path.abspath(pkg))
+    try:
+        import ring_fft_gpu as G
+    except Exception as e:
+        return f"❌ ring_fft not available on this worker: {type(e).__name__}: {e}"
+
+    import torch as _t
+
+    dev = G.device()
+    if dev.type != "cuda":
+        return ("⚠️ no CUDA device on this worker — the numbers below would be CPU "
+                "numbers, which answer a different question. Not running.")
+    prop = _t.cuda.get_device_properties(0)
+    md = [f"### FFT cyclic convolution on `{prop.name}` "
+          f"({prop.total_memory / 1e9:.2f} GB, sm_{prop.major}{prop.minor})",
+          "",
+          "| N | steps | batch | matmul ms | fft ms | speedup | max abs diff |",
+          "|---|---|---|---|---|---|---|"]
+    for ns in str(n_list).split(","):
+        n = int(ns.strip())
+        if n not in (8, 16, 32, 64, 128):
+            continue
+        r = G.bench(n, steps=int(steps), batch=int(batch), reps=int(reps), dev=dev)
+        md.append(f"| {r['n']} | {r['steps']} | {r['batch']} | {r['matmul_ms']:.4f} | "
+                  f"{r['fft_ms']:.4f} | **{r['speedup']:.2f}×** | {r['max_abs_diff']:.1e} |")
+    md += ["", "batch scaling at N=128:", "",
+           "| batch | matmul ms | fft ms | speedup |", "|---|---|---|---|"]
+    for b in (1, 8, 64, 512, 4096):
+        r = G.bench(128, steps=int(steps), batch=b, reps=10, dev=dev)
+        md.append(f"| {b} | {r['matmul_ms']:.4f} | {r['fft_ms']:.4f} | **{r['speedup']:.2f}×** |")
+    md += ["", "> Only the ring graph is circulant. The k-NN graph keeps the matmul."]
+    return "\n".join(md)
+
+
 @spaces.GPU(duration=60)
 def vram_diag():
     """What is actually on the device right now?  Measured, not assumed.
@@ -1302,6 +1348,9 @@ with gr.Blocks(title="6in1") as demo:
             ev_md = gr.Markdown()
             ev_df = gr.Dataframe(label="per problem")
             ev_btn.click(evaluate_student, [ev_n, ev_off], [ev_md, ev_df])
+            fr_btn = gr.Button("FFT ring bench (real GPU numbers)", variant="secondary")
+            fr_md = gr.Markdown()
+            fr_btn.click(fft_ring_bench, [], [fr_md])
             vd_btn = gr.Button("VRAM diagnostic (what is resident?)", variant="secondary")
             vd_md = gr.Markdown()
             vd_btn.click(vram_diag, [], [vd_md])
