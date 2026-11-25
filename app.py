@@ -1024,24 +1024,31 @@ def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 5
     floors = []
     per_row = []
     for b, r in enumerate(batch):
-        enc = student_tok(texts[b], return_tensors="pt", add_special_tokens=False)
+        # offsets must come from the SAME encoding the teachers used, or the char grid
+        # silently disagrees and pairs get dropped (or, worse, misaligned).
+        enc = student_tok(texts[b], return_tensors="pt", add_special_tokens=False,
+                          return_offsets_mapping=True)
         ids = enc["input_ids"].to(dev)
-        so = _t._char_offsets(student_tok, ids[0].cpu())
+        so = [int(e) for _, e in enc["offset_mapping"][0].tolist()]
         m = {o: i for i, o in enumerate(so)}
         pairs = [(m[o] - 1, j) for j, o in enumerate(offs[b]) if o in m and m[o] - 1 >= 0]
         if not pairs:
             per_row.append({"subject": r["subject"], "positions": 0, "kl": None, "top1": None})
             continue
-        with torch.no_grad():
-            logits = student(input_ids=ids,
-                             attention_mask=enc.get("attention_mask", torch.ones_like(ids)).to(dev),
-                             use_cache=False).logits[0]
         si = torch.as_tensor([p[0] for p in pairs], device=dev)
         tj = torch.as_tensor([p[1] for p in pairs], device=dev)
+        with torch.no_grad():
+            out = student(input_ids=ids,
+                          attention_mask=enc.get("attention_mask", torch.ones_like(ids)).to(dev),
+                          use_cache=False)
+            # slice to the aligned positions BEFORE any fp32 work: the full (L, 248k)
+            # upcast is what made this path OOM on the same card the trainer uses
+            logits = out.logits[0][si]
+            del out
         tgt = torch.from_numpy(fused[b]).to(dev)[tj]                    # (n, |V|) log-probs
         ki, kv, tail = build_T_target(tgt, k=min(k, tgt.shape[-1]), T=1.0)
         with torch.no_grad():
-            kl = distill_kl(logits[si], ki, kv, spine_ids, T=1.0)
+            kl = distill_kl(logits, ki, kv, spine_ids, T=1.0)
             # top-1 agreement on the student's *own* vocabulary vs the fused argmax
             fused_top = ki.gather(-1, kv.argmax(-1, keepdim=True)).squeeze(-1)   # spine idx
             stu_top_spine = logits[si].index_select(-1, spine_ids).argmax(-1)
