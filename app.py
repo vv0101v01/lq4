@@ -51,6 +51,10 @@ DTYPE = torch.bfloat16
 # --------------------------------------------------------------------------------------
 # model zoo (revisions verified 2026-11-25)
 # --------------------------------------------------------------------------------------
+# Loading all four teachers fills a t4-small (14.6 / 14.74 GiB) and leaves no room for
+# the student, the LFM embedder, or any activation.  Only the first two are loaded at
+# import; `_ensure_teachers(names)` loads more on demand (and frees what it drops).
+WARM_NAMES = {"K2-Horizon-0.9B", "Limite-1B-Violetto"}
 SPECS = [
     ModelSpec(
         name="K2-Horizon-0.9B",
@@ -154,7 +158,11 @@ _patch_lfm()
 def _load_engine():
     t0 = time.perf_counter()
     try:
-        eng = FusionEngine(SPECS, dtype=DTYPE, log=LOAD_LOG.append)   # device inferred
+        warm = [sp for sp in SPECS if sp.name in WARM_NAMES]
+        eng = FusionEngine(warm, dtype=DTYPE, log=LOAD_LOG.append)   # device inferred
+        if len(warm) < len(SPECS):
+            LOAD_LOG.append(f"ℹ️ loaded {len(warm)}/{len(SPECS)} generators to leave VRAM for "
+                            f"the student; the fusion tab loads the rest on demand")
         LOAD_LOG.append(f"✅ spine: |V| = {len(eng.spine):,} shared tokens over {len(eng.names)} generators ({time.perf_counter() - t0:.0f}s)")
         return eng
     except Exception as e:
@@ -165,6 +173,61 @@ def _load_engine():
                             "tabs need it, the Diagnostics numbers do not.")
         traceback.print_exc()
         return None
+
+
+def _ensure_teachers(want: list[str] | None = None, log=print) -> list[str]:
+    """Make sure the requested teachers are resident, evicting any that are not.
+
+    t4-small has 14.74 GiB.  Four teachers are 14.6 GiB and the student + activations
+    need ~3 GB more, so the resident set has to be chosen per request instead of
+    loading everything at import and hoping.
+    """
+    import gc
+
+    global ENGINE
+    if ENGINE is None:
+        return []
+    want = list(want or ENGINE.order)
+    have = [n for n in ENGINE.order if n in ENGINE.model]
+    # free what we do not need
+    for n in [h for h in have if h not in want]:
+        m = ENGINE.model.pop(n, None)
+        ENGINE.tok.pop(n, None); ENGINE.stops.pop(n, None)
+        if m is not None:
+            try:
+                m.to("meta")
+            except Exception:
+                pass
+            del m
+    gc.collect(); torch.cuda.empty_cache()
+    # load what is missing
+    tok_of = {n: (ENGINE.tok[n], ENGINE.stops[n]) for n in ENGINE.model}
+    for sp in SPECS:
+        if sp.name in want and sp.name not in ENGINE.model:
+            try:
+                if ENGINE.model and _vram_free_gb() < 2.2:
+                    log(f"⏸️ not loading {sp.name}: only {_vram_free_gb():.1f} GB free")
+                    continue
+                from transformers import AutoModelForCausalLM, AutoTokenizer
+
+                kw = dict(revision=sp.rev, trust_remote_code=sp.trust)
+                if sp.kind == "vlm":
+                    from transformers import AutoModelForImageTextToText as _cls
+                else:
+                    _cls = AutoModelForCausalLM
+                tok = AutoTokenizer.from_pretrained(sp.repo, **kw)
+                model = _cls.from_pretrained(sp.repo, dtype=ENGINE.dtype, **kw).to(ENGINE.device).eval()
+                ENGINE.tok[sp.name] = tok
+                ENGINE.model[sp.name] = model
+                ENGINE.stops[sp.name] = stop_ids_for(tok)
+                tok_of[sp.name] = (tok, ENGINE.stops[sp.name])
+                log(f"⬆️ loaded {sp.name} on demand ({_vram_free_gb():.1f} GB free)")
+            except Exception as e:
+                log(f"❌ {sp.name}: {type(e).__name__}: {e}")
+    ENGINE.names = [n for n in ENGINE.order if n in ENGINE.model]
+    if len(ENGINE.names) >= 2:
+        ENGINE.spine = build_spine(tok_of)
+    return ENGINE.names
 
 
 def _load_lfm():
@@ -348,6 +411,11 @@ def fuse_models(prompt, active, k2_w, limite_w, qwen_w, r1_w, rule, max_new_toke
     if not active or len(active) < 2:
         raise gr.Error("Select at least two generators.")
     wmap = {"K2-Horizon-0.9B": k2_w, "Limite-1B-Violetto": limite_w, "Qwen3.5-0.8B": qwen_w, "DeepSeek-R1-Distill-Qwen-1.5B": r1_w}
+    # only two teachers are resident at import (see WARM_NAMES); bring in whatever the
+    # user actually selected, and drop the rest so the VRAM budget still fits
+    resident = _ensure_teachers(list(active), log=LOAD_LOG.append)
+    if len(resident) < 2:
+        raise gr.Error("Could not load the selected generators — see Diagnostics.")
     active = [n for n in active if n in ENGINE.names]
     if len(active) < 2:
         raise gr.Error("Selected generators did not load — see Diagnostics.")
