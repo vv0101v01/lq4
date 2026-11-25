@@ -49,8 +49,12 @@ def spine_gather(student_logits: torch.Tensor, spine_ids: torch.Tensor) -> torch
     gather with spine indices; never mix the two index spaces.
     """
     sid = spine_ids.to(student_logits.device).long()
-    lp = torch.log_softmax(student_logits.float(), dim=-1)
-    sel = lp.index_select(-1, sid)           # (..., |V|)
+    # Gather FIRST, in the student's own dtype, then upcast only the (..., |V|) slice.
+    # The old order — .float() then log_softmax then index_select — materialised two
+    # extra (..., 248k) float32 tensors per call.  At n=1024 aligned positions that is
+    # 2 x 1.02 GB of pure transient, which is what pushed t4-small over the edge.
+    sel = student_logits.index_select(-1, sid)   # (..., |V|)
+    sel = torch.log_softmax(sel.float(), dim=-1)
     # The teacher's law is only defined ON the spine, so the student must be
     # renormalised there too.  Skip this and any mass the student puts outside
     # the spine is silently charged as KL — measured 1.69 nats on a toy case where

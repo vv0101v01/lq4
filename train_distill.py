@@ -193,8 +193,13 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
         if len(batch_rows) < bs:  # wrap
             batch_rows += [rows[i] for i in order[: bs - len(batch_rows)]]
         fb = teachers.logits([_prompt_of(r) + _solution_of(r) for r in batch_rows], max_len)
-        fused = teachers.fused_target(fb, weights, ragged=True)   # list of (P_b, |V|)
-        offs = _shared_offsets(teachers, fb, weights)
+        # fused_target + offsets only need logits, never gradients.  Left outside
+        # inference_mode they keep the whole teacher batch's autograd bookkeeping
+        # alive across the student backward, which is invisible in `loss` but shows
+        # up as VRAM that never comes back between calls.
+        with torch.inference_mode():
+            fused = teachers.fused_target(fb, weights, ragged=True)   # list of (P_b, |V|)
+            offs = _shared_offsets(teachers, fb, weights)
 
         loss_terms, npos = [], 0
         for b, r in enumerate(batch_rows):

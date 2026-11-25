@@ -822,17 +822,25 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
         resumed_from = f"{os.path.basename(ck)} @ step {st}"
         LOAD_LOG.append(f"↩️ resumed {resumed_from}")
 
-    hist = TD.train_student(
-        teachers, ENGINE.spine, student_tok, student, rows, steps,
-        k=k, T=2.0, lr=lr, bs=1, max_len=max_len, out_dir=CKPT_DIR, save_every=1,
-        log=lambda m: LOAD_LOG.append(m),
-    )
+    LOAD_LOG.append(f"📊 budget before train: {_vram_report()}")
+    try:
+        hist = TD.train_student(
+            teachers, ENGINE.spine, student_tok, student, rows, steps,
+            k=k, T=2.0, lr=lr, bs=1, max_len=max_len, out_dir=CKPT_DIR, save_every=1,
+            log=lambda m: LOAD_LOG.append(m),
+        )
+    finally:
+        # A failed step used to leave its activations and grads on the device; the
+        # next call then started with less VRAM and the failure cascaded
+        # (322 -> 284 -> 230 -> 112 -> 86 -> 12 MiB free).  Drop the student and
+        # its optimizer unconditionally so every call starts from the same state.
+        del student, opt
+        gc.collect()
+        torch.cuda.empty_cache()
+        LOAD_LOG.append(f"🧹 after train: {_vram_report()}")
     DISTILL_STATE["history"] += [(s, float(l), n) for s, l, n in hist]
     DISTILL_STATE["step"] += len(hist)
     DISTILL_STATE["positions"] += sum(n for _, _, n in hist)
-    del student, opt
-    gc.collect()
-    torch.cuda.empty_cache()
 
     h = DISTILL_STATE["history"]
     dt = time.perf_counter() - t0
@@ -906,6 +914,17 @@ def _select_teachers(engine, want: int):
 
 def _vram_free_gb() -> float:
     return torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0.0
+
+
+def _vram_report() -> str:
+    """`free` alone cannot tell "teachers too big" from "previous call leaked"."""
+    if not torch.cuda.is_available():
+        return "no gpu"
+    free, total = torch.cuda.mem_get_info()
+    alloc = torch.cuda.memory_allocated()
+    resident = ",".join(ENGINE.names) if ENGINE is not None else "-"
+    return (f"free {free / 1e9:.2f}/{total / 1e9:.2f} GB · pytorch {alloc / 1e9:.2f} GB "
+            f"· resident [{resident}]")
 
 
 REPORT_DIR = os.path.join(_PERSIST if os.path.isdir(_PERSIST) else HERE, "reports")
