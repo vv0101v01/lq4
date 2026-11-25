@@ -286,6 +286,8 @@ def _should_load() -> bool:
 
 
 ENGINE: FusionEngine | None = _load_engine() if _should_load() else None
+for _l in LOAD_LOG:  # mirror to stdout: the HF log view is the only forensic trail
+    print("[load]", _l, flush=True)
 LFM_TOK, LFM = (None, None) if SKIP_LOAD else _load_lfm()
 
 
@@ -930,6 +932,32 @@ def _vram_report() -> str:
 REPORT_DIR = os.path.join(_PERSIST if os.path.isdir(_PERSIST) else HERE, "reports")
 
 
+@spaces.GPU(duration=60)
+def vram_diag():
+    """What is actually on the device right now?  Measured, not assumed.
+
+    Called before every training chunk while the memory budget is being fixed; it
+    answers the only question that matters — did the teachers really load, and how
+    much is still free for the student.
+    """
+    import gc
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    lines = [f"**device** `{torch.cuda.get_device_name(0)}`",
+             f"**free** {_vram_free_gb():.2f} GB",
+             f"**pytorch allocated** {torch.cuda.memory_allocated() / 1e9:.2f} GB",
+             f"**pytorch reserved** {torch.cuda.memory_reserved() / 1e9:.2f} GB"]
+    if ENGINE is None:
+        lines.append("**ENGINE** None")
+    else:
+        lines.append(f"**ENGINE resident** {ENGINE.names} ({len(ENGINE.names)}/{len(SPECS)} specs)")
+        lines.append(f"**spine** |V| = {len(ENGINE.spine):,}" if ENGINE.spine is not None else "**spine** None")
+    for l in LOAD_LOG[-12:]:
+        lines.append(f"- {l}")
+    return "\n".join(lines)
+
+
 @spaces.GPU(duration=240)
 def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 512,
                      teachers_n: int = 2, offset_test: bool = True):
@@ -1252,6 +1280,9 @@ with gr.Blocks(title="6in1") as demo:
             ev_md = gr.Markdown()
             ev_df = gr.Dataframe(label="per problem")
             ev_btn.click(evaluate_student, [ev_n, ev_off], [ev_md, ev_df])
+            vd_btn = gr.Button("VRAM diagnostic (what is resident?)", variant="secondary")
+            vd_md = gr.Markdown()
+            vd_btn.click(vram_diag, [], [vd_md])
             ds_btn.click(distill_step, [ds_steps, ds_k, ds_lr, ds_max, ds_lim, ds_fresh, ds_tn], ds_out)
             ds_ref.click(distill_md, [], ds_out)
 
