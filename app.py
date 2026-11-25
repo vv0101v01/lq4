@@ -183,7 +183,26 @@ def _load_lfm():
 
 
 SKIP_LOAD = os.environ.get("SIXIN1_SKIP_LOAD") == "1"  # lets CI build the UI without a GPU
-ENGINE: FusionEngine | None = None if SKIP_LOAD else _load_engine()
+def _should_load() -> bool:
+    """Loading 4 teachers needs ~10 GB of weights — fine on a ZeroGPU T4 (16 GB VRAM),
+    fatal on `cpu-basic` (16 GB *RAM total*, where the runtime alone uses several GB).
+    A ZeroGPU restart that lands on cpu-basic must therefore skip loading and let the
+    UI explain, instead of dying with 'Memory limit exceeded (16.0G)'.
+    """
+    if SKIP_LOAD:
+        return False
+    if not torch.cuda.is_available():
+        LOAD_LOG.append("⏸️ no GPU on this worker — models not loaded. "
+                        "Fusion/distillation need the ZeroGPU runtime (T4).")
+        return False
+    free = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0.0
+    if free < 9.0:
+        LOAD_LOG.append(f"⏸️ only {free:.1f} GB of VRAM free — need ~10 GB for the teachers; not loading.")
+        return False
+    return True
+
+
+ENGINE: FusionEngine | None = _load_engine() if _should_load() else None
 LFM_TOK, LFM = (None, None) if SKIP_LOAD else _load_lfm()
 
 
