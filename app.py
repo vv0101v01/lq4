@@ -966,8 +966,9 @@ def _vram_report() -> str:
     free, total = torch.cuda.mem_get_info()
     alloc = torch.cuda.memory_allocated()
     resident = ",".join(ENGINE.names) if ENGINE is not None else "-"
+    peak = torch.cuda.max_memory_allocated() / 1e9
     return (f"free {free / 1e9:.2f}/{total / 1e9:.2f} GB · pytorch {alloc / 1e9:.2f} GB "
-            f"· resident [{resident}]")
+            f"· peak {peak:.2f} GB · resident [{resident}]")
 
 
 REPORT_DIR = os.path.join(_PERSIST if os.path.isdir(_PERSIST) else HERE, "reports")
