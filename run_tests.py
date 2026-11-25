@@ -41,6 +41,7 @@ SUITES = [
 ]
 
 FILES = [
+    ("tests/test_ring_fft.py", "ring diffusion == graph.diffuse to 1e-10", False),
     ("tests/test_last_boxed.py", "answer extractor behaviour", False),
     ("tests/test_counts.py", "vocabulary-intersection numbers vs deployed code", False),
     ("tests/test_teacher.py", "byte alignment on real tokenizers", True),

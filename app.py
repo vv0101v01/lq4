@@ -533,11 +533,37 @@ def _dynamics(w_ring, w_knn, emb, steps=200):
     x0 = graph.pca2(emb)
     rows = []
     for name, w in (("ring", w_ring), ("LFM k-NN", w_knn)):
-        d = graph.diffuse(w, x0, steps)
+        # The ring is circulant, so its diffusion is a cyclic convolution and can go
+        # through the FFT path; the k-NN graph is NOT circulant and must stay on the
+        # general matmul.  dispatching per graph rather than per call is the point.
+        if name == "ring":
+            d, backend = graph.diffuse_fft(w, x0, steps)
+            LOAD_LOG.append(f"🔁 ring diffusion backend: {backend}")
+        else:
+            d = graph.diffuse(w, x0, steps)
         r = graph.kuramoto(w, steps)
         rows += [dict(step=t, value=float(d[t] / d[0]), series=f"{name} · concept dispersion") for t in range(steps + 1)]
         rows += [dict(step=t, value=float(r[t]), series=f"{name} · Kuramoto R") for t in range(steps + 1)]
     return pd.DataFrame(rows)
+
+
+def _ring_backend_note(w_ring, emb, steps=1):
+    """Which path would `diffuse_fft` take, and why — shown in Diagnostics.
+
+    A silent CPU fallback is indistinguishable from a speedup, so the reason is
+    surfaced rather than the claim.
+    """
+    import ring_fft_adapter as A
+
+    if not A.available():
+        return "conv backend: **numpy matmul** (ring_fft not on the path)"
+    rep = A.backend_report()
+    n = int(w_ring.shape[0])
+    accel = n in (8, 16, 32, 64, 128)
+    gpu = bool(rep.get("cuda")) and bool(rep.get("extension")) and n in tuple(rep.get("gpu_sizes") or ())
+    return (f"conv backend: **{'CUDA ring_fft' if gpu else 'CPU ring_fft' if accel else 'numpy matmul'}**"
+            f" · N={n} · accelerated range {'yes' if accel else 'no'}"
+            f" · cuda={rep.get('cuda')} · kernel built={rep.get('extension')}")
 
 
 def _stats_df(w_ring, w_knn, fam):

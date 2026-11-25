@@ -108,6 +108,28 @@ def graph_stats(w: np.ndarray, labels=None, kappa: float = 0.7) -> dict:
     return out
 
 
+def diffuse_fft(w: np.ndarray, x0: np.ndarray, steps: int, eta: float = 0.5,
+                prefer: str = "auto") -> tuple[np.ndarray, str]:
+    """`diffuse` via cyclic convolution — the accelerated path, with its backend named.
+
+    On a ring graph `w` is circulant, so `P @ x` is a cyclic convolution and can be
+    done in O(N log N) instead of O(N^2).  Sizes 8/16/32/64 are covered (the kernel
+    in fft_ring/); other sizes fall back to `diffuse` and SAY SO, because a silent
+    fallback that reports a speedup is worse than no speedup.
+
+    Returns (dispersion, backend) — the call sites in app.py display the backend so
+    a CPU fallback can never be mistaken for the GPU path.
+    """
+    from ring_fft_adapter import available, accelerate
+
+    if not available():
+        return diffuse(w, x0, steps, eta), "numpy (ring_fft not installed)"
+    n = int(w.shape[0])
+    if n not in (8, 16, 32, 64):
+        return diffuse(w, x0, steps, eta), f"numpy (N={n} outside the accelerated range)"
+    return accelerate(w, x0, steps, eta, prefer)
+
+
 def diffuse(w: np.ndarray, x0: np.ndarray, steps: int, eta: float = 0.5) -> np.ndarray:
     """Random-walk heat flow x <- (1-eta) x + eta * D^-1 W x (stable for eta <= 1 on any graph).
     Returns the per-step dispersion (mean distance of agents to the population mean)."""
