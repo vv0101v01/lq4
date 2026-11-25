@@ -1,0 +1,45 @@
+{
+ "built": "dataset.py",
+ "sources_checked": {
+  "math": {
+   "repo": "EleutherAI/hendrycks_math",
+   "license": "mit"
+  },
+  "gsm8k": {
+   "repo": "openai/gsm8k",
+   "license": "mit"
+  },
+  "numina": {
+   "repo": "AI-MO/NuminaMath-CoT",
+   "license": "apache-2.0"
+  }
+ },
+ "counts": {
+  "math/mit/algebra:test": 1187,
+  "math/mit/counting_and_probability:test": 474,
+  "math/mit/geometry:test": 479,
+  "math/mit/intermediate_algebra:test": 901,
+  "math/mit/number_theory:test": 540,
+  "math/mit/prealgebra:test": 870,
+  "math/mit/precalculus:test": 546
+ },
+ "schema": [
+  "id",
+  "source",
+  "license",
+  "split",
+  "subject",
+  "problem",
+  "solution",
+  "answer",
+  "level"
+ ],
+ "total": 4997,
+ "with_answer": 4997,
+ "dedupe": {
+  "input": 5000,
+  "exact_dup": 0,
+  "near_dup": 3,
+  "kept": 4997
+ }
+}

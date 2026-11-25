@@ -1,0 +1,19 @@
+# data & artifacts — regenerable from dataset.py, and 20 MB is not source
+data/corpus/*.jsonl
+data/corpus/*.jsonl.gz
+ckpt/
+*.pt
+*.safetensors
+
+# never commit secrets
+.env
+*.token
+REPORT.md
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+build/
+dist/

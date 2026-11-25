@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is what the Space runs; 3.12 catches "works on my machine"
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+
+      - name: Install the rest
+        run: pip install "transformers==5.15.1" numpy pandas matplotlib peft spaces
+
+      - name: Byte table (works with no torch at all)
+        run: python bytes_vocab.py
+
+      - name: Full suite
+        env:
+          SIXIN1_SKIP_LOAD: "1"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: python run_tests.py
+
+      - name: Fast subset must also pass standalone
+        env:
+          SIXIN1_SKIP_LOAD: "1"
+        run: python run_tests.py --fast
+
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Every module must at least parse
+        run: python -m compileall -q . && echo "all modules compile"
+
+      - name: No secrets committed
+        run: |
+          if grep -rInE '(hf_[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,})' \
+               --include='*.py' --include='*.md' --include='*.json' --include='*.yml' . ; then
+            echo "::error::a token is committed"
+            exit 1
+          fi
+          echo "no tokens found"
+
+      - name: No orphan modules
+        run: |
+          # a module is "live" if another module imports it, OR it is an entry point
+          # (has __main__), OR run_tests.py exercises it.  Anything else is dead code.
+          python - <<'PY'
+          import pathlib, re, sys
+          root = pathlib.Path(".")
+          reg = (root / "run_tests.py").read_text()
+          src = "\n".join(p.read_text() for p in list(root.glob("*.py")) + list((root / "tests").glob("*.py")))
+          dead = []
+          for p in sorted(root.glob("*.py")):
+              m = p.stem
+              if m == "run_tests":
+                  continue
+              imported = re.search(rf"\b(import {m}\b|from {m} import)", src)
+              entry = re.search(r"^if __name__ ==", p.read_text(), re.M)
+              tested = re.search(rf'\("{m}"', reg)
+              if not (imported or entry or tested):
+                  dead.append(p.name)
+          if dead:
+              print("::error::dead modules:", dead)
+              sys.exit(1)
+          print("no dead modules")
+          PY
+
+      - name: Every module that defines a selftest is registered in run_tests.py
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          reg = pathlib.Path("run_tests.py").read_text()
+          missing = []
+          for p in pathlib.Path(".").glob("*.py"):
+              if re.search(r"^def _?selftest\(", p.read_text(), re.M) and p.stem not in reg:
+                  missing.append(p.name)
+          if missing:
+              print("::error::selftest not wired into run_tests.py:", missing)
+              sys.exit(1)
+          print("all selftests are registered")
+          PY

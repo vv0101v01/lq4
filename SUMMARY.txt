@@ -1,0 +1,4 @@
+6in1 = frame1 skeleton + 5 models
+Space: https://huggingface.co/spaces/Transynergy/6in1 (private, RUNNING, zero-a10g)
+Commit: 8478ecd
+Tests (live): 4-way fuse 200 tok/20.2s; K2+Qwen3.5 Cantonese 21.2 tok/s; LFM auto-route -> Limite 87.6%+R1 12.4%; graph 1275 edges lambda2 0.53975; LFM selfcheck cos 0.9996 r 0.9999

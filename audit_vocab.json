@@ -1,0 +1,44 @@
+{
+ "surface": {
+  "K2": 64256,
+  "Limite": 151667,
+  "Qwen3.5": 248077,
+  "R1": 151661
+ },
+ "pairs": {
+  "K2 ∩ Limite": 42991,
+  "K2 ∩ Qwen3.5": 50939,
+  "K2 ∩ R1": 42990,
+  "Limite ∩ Qwen3.5": 131610,
+  "Limite ∩ R1": 151660,
+  "Qwen3.5 ∩ R1": 131603
+ },
+ "kway": {
+  "K2 ∩ Limite ∩ Qwen3.5": 42208,
+  "K2 ∩ Limite ∩ R1": 42990,
+  "K2 ∩ Qwen3.5 ∩ R1": 42207,
+  "Limite ∩ Qwen3.5 ∩ R1": 131603,
+  "K2 ∩ Limite ∩ Qwen3.5 ∩ R1": 42207
+ },
+ "spine": 42207,
+ "coverage_pct": {
+  "zh+en+math": {
+   "K2": 100.0,
+   "Limite": 90.3,
+   "Qwen3.5": 95.1,
+   "R1": 90.3
+  },
+  "cantonese": {
+   "K2": 100.0,
+   "Limite": 82.1,
+   "Qwen3.5": 89.7,
+   "R1": 82.1
+  },
+  "english-code": {
+   "K2": 91.6,
+   "Limite": 84.4,
+   "Qwen3.5": 91.7,
+   "R1": 84.4
+  }
+ }
+}
