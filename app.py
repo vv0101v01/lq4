@@ -1051,7 +1051,9 @@ def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 5
             kl = distill_kl(logits, ki, kv, spine_ids, T=1.0)
             # top-1 agreement on the student's *own* vocabulary vs the fused argmax
             fused_top = ki.gather(-1, kv.argmax(-1, keepdim=True)).squeeze(-1)   # spine idx
-            stu_top_spine = logits[si].index_select(-1, spine_ids).argmax(-1)
+            # `logits` is ALREADY the (n, V_student) slice — indexing it with si again
+            # is an out-of-range gather and trips a CUDA device-side assert.
+            stu_top_spine = logits.index_select(-1, spine_ids).argmax(-1)
             a = int((fused_top == stu_top_spine).sum())
         total_pos += len(pairs)
         kl_sum += float(kl.sum())
