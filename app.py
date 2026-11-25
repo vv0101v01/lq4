@@ -871,14 +871,13 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
     finally:
         # The student is cached for the worker's lifetime, so there is nothing to free
         # here — only the per-chunk activations, which the allocator reuses anyway.
-        # `hist` is deliberately dropped: it is copied into DISTILL_STATE and keeping
-        # the training loop's frame reachable is what used to pin the whole step.
-        if STUDENT["model"] is student:
-            STUDENT["step"] = DISTILL_STATE["step"]
-        hist = None
+        # NB: do NOT null `hist` here; it is the return value and is consumed below.
         gc.collect()
         torch.cuda.empty_cache()
         LOAD_LOG.append(f"🧹 after train: {_vram_report()}")
+    hist = hist or []
+    if STUDENT["model"] is student:
+        STUDENT["step"] = DISTILL_STATE["step"] + len(hist)
     DISTILL_STATE["history"] += [(s, float(l), n) for s, l, n in hist]
     DISTILL_STATE["step"] += len(hist)
     DISTILL_STATE["positions"] += sum(n for _, _, n in hist)
