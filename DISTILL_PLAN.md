@@ -444,6 +444,34 @@ Hygiene job 會在以下情況**失敗**：提交咗 token、有孤兒模組、�
 > 因為 module 仍被 autograd hook / device map 引用。`.to("meta")` 才真正釋放。
 > bug 7 則是架構問題 —— 唔係「清得唔夠狠」，而係「一開始就唔應該全部載入」。
 
+### 8.8 OOM 的真正成因（三步才找對）
+
+OOM 唔係單一 bug，係三層疊加。逐層實測：
+
+| 症狀 | 誤判 | 真相 |
+|---|---|---|
+| `14.74 GiB ... 2.12 MiB free`，allocated 14.60 GB | 「老師太多」 | 老師總數 14.6 GB 確實佔滿，但 `_select_teachers` 的 `.to("meta")` 已能釋放 → 仍然 OOM，因為… |
+| 第一次 call 就到達 `train_student`，只剩 322 MiB | 「student 建不成」 | student **建成了**。爆點在 `spine_gather`：`logits.float()` → `log_softmax` → `index_select`，每個 call 對 **248k 全詞表**做兩次 float32 materialise。n=1024 → 2 × 1.02 GB 純暫存 |
+| free 逐 call 遞減：322 → 284 → 230 → 112 → 86 → 12 MiB | 「ZeroGPU 碎片」 | **失敗的 call 會洩漏**：`train_student` 拋錯時 `student`/`opt` 從未釋放，下一次 call 起點更差 |
+
+三個修法（`1899816`）：
+1. `spine_gather` 先 `index_select` 到 42k spine 再 upcast —— 暫存由 2.02 GB 降到 0.17 GB（n=1024）
+2. `distill_step` 用 `finally` 無條件丟棄 `student`/`opt`
+3. `fused_target` / `_shared_offsets` 包進 `inference_mode`
+
+同時加了 VRAM 電表：每次 chunk 前後都印 `free/total · pytorch · resident [names]`。
+**下次 OOM 會直接講出係邊個佔住記憶體**，唔需要再猜三輪。
+
+#### 架構層修正（同期）
+
+4 個 teacher 在 import 時全部載入 = 14.6 / 14.74 GiB，student 永遠無位。
+現在只熱載 2 個（`WARM_NAMES`）；`_ensure_teachers(names)` 按需換入，
+`fuse_models` 會先確保用戶選的 model 在場。
+
+另外修好 `distill_step` 的 `NameError`：`_select_teachers` 從 `ENGINE.model`
+移除條目後，`TeacherStack.model`（dict 副本）仍持有舊引用，必須**淘汰後重建**
+stack。distill 與 evaluate 現在共用 `_teacher_stack(keep)`，唔會再各自漂移。
+
 ### 下一步（我建議次序）
 1. 你去 Space → Diagnostics → **「Measure」**（一粒掣，~5 秒）→ 貼返個表俾我，我即刻定 k 同儲存方案；
 2. 我準備 `dataset.py`（資料 schema + 去重 + licence 欄位）+ 500 條 L2 基準；
