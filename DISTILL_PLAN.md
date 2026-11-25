@@ -472,6 +472,37 @@ OOM 唔係單一 bug，係三層疊加。逐層實測：
 移除條目後，`TeacherStack.model`（dict 副本）仍持有舊引用，必須**淘汰後重建**
 stack。distill 與 evaluate 現在共用 `_teacher_stack(keep)`，唔會再各自漂移。
 
+### 8.9 OOM 已解，但浮現 4 個新 bug（全部已修，1 個待決定）
+
+**OOM 根本原因（三層）** 已確認並修好，實測 `free 10.09 GB / teacher 5.42 GB`：
+
+| 層 | 成因 | 證據 |
+|---|---|---|
+| 1 | import 時載入 4 個 teacher（14.6 / 14.74 GiB） | `vram_diag` 顯示 2 resident、5.42 GB |
+| 2 | **student 完全無截斷**：3 kB 解答 → 3,000 個位置 × 248k 詞表的 LM head 圖 | 訓練前 free 8.25 GB、訓練後 14.41 GB |
+| 3 | 失敗時 traceback 釘住 frame，`finally: del student` 完全無效 | free 逐次 322→284→230→112→86→12 MiB |
+
+修法：import 熱載 2 個 teacher + `_ensure_teachers` 按需換入；student 與 teacher 用**同一 max_len**；`logits[0][si]` 先切片再算；失敗時 `except: raise` 清 frame 後才 `del`。
+
+**新 bug 1：loss 顯示錯。** `distill_step` 印 `history[0]`（整個 worker 生命週期第一條），所以每個 chunk 都印「first 26.8133」。我因此誤判「checkpoint 無載入」兩輪。已改為只報當前 chunk。
+
+**新 bug 2：`evaluate_student` 三重故障。** `import teacher as _t` 被重構刪掉（NameError）→ offset map 與 teacher 不同源 → `logits[si]` 對已切片張量二次索引（CUDA device-side assert）。全部已修。
+
+**新 bug 3（未修，需要設計決定）：loss 無上限。** `distill_kl` 先對 student 在 **spine** 上取 log_softmax、再**截到 k 項再 renormalise**；teacher 側已在 k 上 renormalise。兩邊分母不同 ⇒ KL 沒有 log(k) 上界。實測：student logit scale 50 → KL **687**、scale 500 → KL **6156**。真實訓練 loss 9–27 nats 就是這樣來的：它的絕對值不可詮釋，與 MSE 一樣只可作相對下降參考。
+
+**新 bug 4：student 截斷一開始設得太窄。** 加截斷後 `max_len` 仍是 512，而 p90 答案長度 ~250 token、最長 1,838，29 % 的列答案尾部被切。已改預設 1024（corpus 中位 182 token，cap 幾乎不觸發）。
+
+#### 誠實評估現況（同一評估器，修好後）
+
+| checkpoint | KL (gate <0.35) | top-1 (gate ≥70 %) | 判定 |
+|---|---|---|---|
+| step 366（舊訓練分佈） | 1.662 | 49.4 % | ❌ ❌ |
+| step 499（新訓練分佈） | **2.85** | **23.1 %** | ❌ ❌ |
+
+三個 offset（0 / 8 / 16、共 3,758 個位置）結果一致（KL 2.85/3.18/3.02、top-1 23.1/19.9/21.2 %），不是單一批次的偶然。
+
+> **這是退化，不是量測噪音。** step 366 與 step 499 之差剛好對應「無截斷 vs 1024 截斷」與「不同資料走訪」。但兩者都離門檻很遠，所以**下一步不是調參，而是先確定 loss 的語義（bug 3）** —— 在一個無上界、絕對值不可詮釋的目標上繼續訓練，只會浪費 ZeroGPU 配額。
+
 ### 下一步（我建議次序）
 1. 你去 Space → Diagnostics → **「Measure」**（一粒掣，~5 秒）→ 貼返個表俾我，我即刻定 k 同儲存方案；
 2. 我準備 `dataset.py`（資料 schema + 去重 + licence 欄位）+ 500 條 L2 基準；
