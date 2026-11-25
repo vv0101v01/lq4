@@ -25,11 +25,10 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from bytes_vocab import token_to_bytes
 
-from spine import N_PRAGMA, build_spine, fuse, step_logprobs
+from spine import build_spine, fuse, step_logprobs
 
 
 @dataclass
@@ -200,7 +199,6 @@ def fused_target(batch: TeacherBatch, spine, weights: dict[str, float], rule: st
     (P_b, |V|) arrays.  (Measured: stacking without this raised
     "all input arrays must have the same shape" on the very first evaluation run.)
     """
-    from bytes_vocab import token_to_bytes
 
     names = [n for n in batch.names if n in weights]
     if len(names) < 2:

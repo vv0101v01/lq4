@@ -18,12 +18,12 @@ from transformers import AutoTokenizer
 from bytes_vocab import vocab_bytes
 from spine import build_spine
 
-SPECS = [
-    ("K2", "IFM/K2-Horizon-0.9B", "6b4f28e81b8a77c8b44465a93a452eea198d4ceb"),
-    ("Limite", "paradigma-inc/limite-1b-violetto", "190ee8d9c6777b7c5f8e7592cc00caf495a90ca7"),
-    ("Qwen3.5", "Qwen/Qwen3.5-0.8B", "2fc06364715b967f1860aea9cf38778875588b17"),
-    ("R1", "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", "ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562"),
-]
+# The pins live in registry.py; this module deliberately keeps the SHORT names it
+# uses for its report, so a change to a repo or revision cannot silently diverge
+# between the app and this independent oracle.
+from registry import SPECS as _REGISTRY_SPECS, SHORT as _SHORT
+
+SPECS = [(_SHORT[s.name], s.repo, s.rev) for s in _REGISTRY_SPECS]
 
 PROBES = {
     "zh+en+math": "證明：若 n 為正整數，則 n^3 - n 可被 6 整除。 Proof: n^3 - n = (n-1)n(n+1) is a product of three consecutive integers, so it is divisible by 2 and 3.",

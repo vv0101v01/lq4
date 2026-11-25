@@ -27,7 +27,6 @@ limb breaks).
 from __future__ import annotations
 
 import numpy as np
-import torch
 
 END, THINK, ANSWER = 0, 1, 2
 N_PRAGMA = 3

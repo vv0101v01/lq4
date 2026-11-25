@@ -33,16 +33,15 @@ SUITES = [
     ("spine", "selftest", "shared spine + fuse arithmetic", False),
     ("fuse", "_selftest", "boxed-stop policy, ModelSpec, stop ids", False),
     ("targets", "_selftest", "distillation loss (perfect student => 0)", False),
-    ("sparse_targets", "_selftest", "top-k encode/TV identity", False),
-    ("distill", "_selftest", "fused target on the spine", False),
     ("train_distill", "_selftest", "atomic checkpoints, corpus reader", False),
-    ("dataset", "_selftest", "corpus schema, dedupe, licence manifest", False),
     ("probe", "_selftest", "verdict(k) picks the cheapest sufficient k", False),
     ("teacher", "_selftest", "byte offsets, boundary intersection", False),
+    ("metrics", "_selftest", "gate arithmetic: perfect student => KL 0, top-1 100%", False),
     ("graph", "_selftest", "laplacian, diffusion, kuramoto", True),
 ]
 
 FILES = [
+    ("tests/test_last_boxed.py", "answer extractor behaviour", False),
     ("tests/test_counts.py", "vocabulary-intersection numbers vs deployed code", False),
     ("tests/test_teacher.py", "byte alignment on real tokenizers", True),
     ("tests/test_probe.py", "geometric-mean invariant, opposed teachers", True),

@@ -39,7 +39,6 @@ import time
 import numpy as np
 import torch
 
-from spine import N_PRAGMA
 from targets import build_T_target, distill_kl
 
 PROMPT_SUFFIX = "\n\nSolve step by step. Put the final answer in \\boxed{}."
@@ -96,7 +95,6 @@ def _spine_ids(teachers, name: str | None = None):
     """The spine entry -> student token id map.  For the Qwen3.5 student the spine is
     a subset of its vocabulary, so this is the identity on the student side; for a
     different student it is `spine.token_ids(student_name)`."""
-    from spine import N_PRAGMA
 
     sp = teachers.spine
     name = name or ("Qwen3.5-0.8B" if "Qwen3.5-0.8B" in sp.names else sp.names[0])

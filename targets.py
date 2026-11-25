@@ -17,9 +17,7 @@
 
 from __future__ import annotations
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 
 NEG = -1e30           # 代替 -inf：令 softmax / logsumexp 唔會產生 nan（同 train_distill 的 -1e9 一致，取更負值）
 

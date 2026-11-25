@@ -12,16 +12,13 @@ not need it.
 
 from __future__ import annotations
 
-import math
-import re
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-from spine import ANSWER, N_PRAGMA, SharedSpine, THINK, build_spine, fuse
+from spine import SharedSpine, THINK, build_spine, fuse
 
 END = 0  # pseudo-token index inside spine space (= len(spine))
 

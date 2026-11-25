@@ -20,7 +20,6 @@ Load-time compatibility patches for transformers 5.15 are applied at import
 from __future__ import annotations
 
 import json
-import math
 import glob
 import os
 import re
@@ -42,7 +41,8 @@ import transformers  # noqa: E402
 from transformers import AutoModel, AutoTokenizer  # noqa: E402
 
 import graph  # noqa: E402
-from fuse import FusionEngine, ModelSpec, stop_ids_for  # noqa: E402
+import metrics as M  # noqa: E402
+from fuse import FusionEngine, stop_ids_for  # noqa: E402
 import probe  # noqa: E402
 from spine import build_spine  # noqa: E402
 
@@ -51,44 +51,8 @@ DTYPE = torch.bfloat16
 # --------------------------------------------------------------------------------------
 # model zoo (revisions verified 2026-11-25)
 # --------------------------------------------------------------------------------------
-# Loading all four teachers fills a t4-small (14.6 / 14.74 GiB) and leaves no room for
-# the student, the LFM embedder, or any activation.  Only the first two are loaded at
-# import; `_ensure_teachers(names)` loads more on demand (and frees what it drops).
-WARM_NAMES = {"K2-Horizon-0.9B", "Limite-1B-Violetto"}
-SPECS = [
-    ModelSpec(
-        name="K2-Horizon-0.9B",
-        repo="IFM/K2-Horizon-0.9B",
-        rev="6b4f28e81b8a77c8b44465a93a452eea198d4ceb",
-        trust=True,
-        kwargs={"reasoning_effort": "low"},
-    ),
-    ModelSpec(
-        name="Limite-1B-Violetto",
-        repo="paradigma-inc/limite-1b-violetto",
-        rev="190ee8d9c6777b7c5f8e7592cc00caf495a90ca7",
-        trust=True,
-    ),
-    ModelSpec(
-        name="Qwen3.5-0.8B",
-        repo="Qwen/Qwen3.5-0.8B",
-        rev="2fc06364715b967f1860aea9cf38778875588b17",
-        kind="vlm",
-        kwargs={"enable_thinking": False},
-        prompt_suffix="<think>\n\n</think>\n\n",  # leave the empty think block the template opened
-    ),
-    ModelSpec(
-        name="DeepSeek-R1-Distill-Qwen-1.5B",
-        repo="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-        rev="ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562",
-    ),
-]
-SHORT = {
-    "K2-Horizon-0.9B": "K2",
-    "Limite-1B-Violetto": "Limite",
-    "Qwen3.5-0.8B": "Qwen3.5",
-    "DeepSeek-R1-Distill-Qwen-1.5B": "R1",
-}
+from registry import SHORT, SPECS, WARM_NAMES  # single source of truth
+
 LFM_REPO, LFM_REV = "LiquidAI/LFM2.5-Embedding-350M", "f35ae2c91d687658dbf1f2b449382f0b019b9808"
 
 LOAD_LOG: list[str] = []
@@ -232,7 +196,6 @@ def _ensure_teachers(want: list[str] | None = None, log=print) -> list[str]:
     """
     import gc
 
-    global ENGINE
     if ENGINE is None:
         return []
     want = list(want or ENGINE.order)
@@ -364,6 +327,12 @@ def split_reasoning(raw: str) -> tuple[str, str]:
 
 
 def last_boxed(text: str):
+    """Balanced-brace extraction of the last \\boxed{...}.
+
+    This is the ONLY implementation (dataset.py's copy moved to attic/ when that
+    module was superseded).  tests/test_last_boxed.py pins its behaviour so a future
+    "helpful" rewrite cannot quietly change what the pass@1 scorer reads.
+    """
     starts = [m.end() for m in re.finditer(r"\\boxed\{", text or "")]
     if not starts:
         return None
@@ -818,7 +787,6 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
     import gc
 
     import train_distill as TD
-    from teacher import TeacherStack
 
     t0 = time.perf_counter()
     if ENGINE is None:
@@ -888,7 +856,7 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
     h = DISTILL_STATE["history"][-len(hist):] if (hist := locals().get("hist")) else []
     dt = time.perf_counter() - t0
     md = [f"### L3 distillation · chunk of {steps} steps in {dt:.0f}s",
-          f"- loss code: `targets.distill_kl` (support chosen at T=1, T^2 scaling)",
+          "- loss code: `targets.distill_kl` (support chosen at T=1, T^2 scaling)",
           f"- checkpoint dir: `{CKPT_DIR}`{' (persistent)' if CKPT_DIR.startswith('/data') else ' ⚠️ NOT persistent — will be lost on restart'}",
           f"- resumed: {resumed_from or 'no (fresh start)'}",
           f"- **step {DISTILL_STATE['step']}** · {DISTILL_STATE['positions']:,} supervised positions total",
@@ -1014,7 +982,7 @@ def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 5
     import gc
 
     import train_distill as TD
-    from targets import build_T_target, distill_kl
+    from targets import build_T_target
 
     t0 = time.perf_counter()
     if ENGINE is None:
@@ -1049,10 +1017,6 @@ def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 5
     offs = shared_offsets(fb, {n_: 1.0 for n_ in keep})
 
     dev = next(student.parameters()).device
-    total_pos = 0
-    kl_sum = 0.0
-    agree = 0
-    floors = []
     per_row = []
     for b, r in enumerate(batch):
         # offsets must come from the SAME encoding the teachers used, or the char grid
@@ -1061,10 +1025,10 @@ def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 5
                           return_offsets_mapping=True)
         ids = enc["input_ids"].to(dev)
         so = [int(e) for _, e in enc["offset_mapping"][0].tolist()]
-        m = {o: i for i, o in enumerate(so)}
-        pairs = [(m[o] - 1, j) for j, o in enumerate(offs[b]) if o in m and m[o] - 1 >= 0]
+        pairs = M.aligned_pairs(so, offs[b])
         if not pairs:
-            per_row.append({"subject": r["subject"], "positions": 0, "kl": None, "top1": None})
+            per_row.append({"subject": r["subject"], "positions": 0, "kl": None,
+                            "top1": None, "floor": None})
             continue
         si = torch.as_tensor([p[0] for p in pairs], device=dev)
         tj = torch.as_tensor([p[1] for p in pairs], device=dev)
@@ -1079,45 +1043,28 @@ def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 5
         tgt = torch.from_numpy(fused[b]).to(dev)[tj]                    # (n, |V|) log-probs
         ki, kv, tail = build_T_target(tgt, k=min(k, tgt.shape[-1]), T=1.0)
         with torch.no_grad():
-            kl = distill_kl(logits, ki, kv, spine_ids, T=1.0)
-            # top-1 agreement on the student's *own* vocabulary vs the fused argmax
-            fused_top = ki.gather(-1, kv.argmax(-1, keepdim=True)).squeeze(-1)   # spine idx
-            # `logits` is ALREADY the (n, V_student) slice — indexing it with si again
-            # is an out-of-range gather and trips a CUDA device-side assert.
-            stu_top_spine = logits.index_select(-1, spine_ids).argmax(-1)
-            a = int((fused_top == stu_top_spine).sum())
-        total_pos += len(pairs)
-        kl_sum += float(kl.sum())
-        agree += a
-        floors.append(float(tail.mean()))
+            kl, a = M.score_positions(logits, ki=ki, kv=kv, spine_ids=spine_ids, T=1.0)
         per_row.append({"subject": r["subject"], "positions": len(pairs),
-                        "kl": round(float(kl.mean()), 4), "top1": round(a / len(pairs), 3)})
+                        "kl": float(kl.mean()), "top1": a / len(pairs),
+                        "floor": float(tail.mean())})
 
     del student, opt
     gc.collect(); torch.cuda.empty_cache()
 
-    if total_pos == 0:
+    agg = M.summary(per_row)
+    if not agg["positions"]:
         raise gr.Error("no aligned positions in this batch")
-    kl_mean = kl_sum / total_pos
-    agree_pct = 100.0 * agree / total_pos
-    floor = sum(floors) / len(floors)
+    kl_mean, agree_pct, floor, total_pos = agg["kl"], agg["top1"], agg["floor"], agg["positions"]
     dt = time.perf_counter() - t0
-
-    def gate(name, value, ok):
-        return f"| {name} | {value} | {'✅ PASS' if ok else '❌ FAIL'} |"
 
     md = [f"### L3 evaluation · {len(batch)} held-out MATH problems ({dt:.0f}s)",
           f"checkpoint **step {ck_step}** (`{os.path.basename(ck) if ck else 'none'}`) · "
           f"{total_pos:,} aligned positions · k={k}",
           "",
-          "| gate | value | |",
-          "|---|---|---|",
-          gate("KL(student ‖ fused)", f"{kl_mean:.4f} nats", kl_mean < 0.35),
-          gate("top-1 agreement", f"{agree_pct:.1f} %", agree_pct >= 70.0),
-          gate("truncation floor (reference)", f"{floor:.4f} nats", floor < 0.01),
+          M.table(kl_mean, agree_pct, floor),
           "",
-          f"> §6 gates: KL < 0.35 nats, top-1 ≥ 70 %. The student is compared to the "
-          f"**fused** law (the thing it is trained on), not to any single teacher.",
+          "> §6 gates: KL < 0.35 nats, top-1 ≥ 70 %. The student is compared to the "
+          "**fused** law (the thing it is trained on), not to any single teacher.",
           ""]
     out = {f"eval_step{ck_step}": {"kl": kl_mean, "top1": agree_pct, "positions": total_pos,
                                    "floor": floor, "rows": len(batch)}}

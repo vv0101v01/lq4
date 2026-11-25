@@ -25,7 +25,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from spine import N_PRAGMA, build_spine, fuse, step_logprobs
+from spine import fuse, step_logprobs
 
 
 @torch.inference_mode()
@@ -47,7 +47,6 @@ def probe(engine, prompt: str, ks=(8, 16, 32, 64, 128, 256, 512), max_len: int =
     geometric mean of the restricted teacher laws — that identity is what
     `tests/test_probe.py` pins down.
     """
-    from bytes_vocab import vocab_bytes
     from teacher import byte_positions
 
     names = list(engine.names)
