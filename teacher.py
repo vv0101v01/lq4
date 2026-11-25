@@ -111,7 +111,8 @@ class TeacherStack:
 
     # ------------------------------------------------------- the distillation target
     def fused_target(self, batch: TeacherBatch, weights: dict[str, float] | None = None,
-                     rule: str = "product (log-linear)", allow_answer: bool = False, log=print) -> np.ndarray:
+                     rule: str = "product (log-linear)", allow_answer: bool = False, log=print,
+                     ragged: bool = False):
         """(B, L, |V|) log-probs of the fused law, for positions whose tokenizations agree.
 
         Positions are **byte-aligned**: only token boundaries that every teacher
@@ -123,7 +124,7 @@ class TeacherStack:
         mis-aligned target is worse than no target.
         """
         return fused_target(batch, self.spine, weights or {n: 1.0 for n in batch.names}, rule,
-                            tok_of=self.tok, log=log)
+                            tok_of=self.tok, log=log, ragged=ragged)
 
     def per_model_target(self, batch: TeacherBatch, name: str) -> np.ndarray:
         V = len(self.spine)
