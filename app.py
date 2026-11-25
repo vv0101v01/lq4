@@ -676,7 +676,12 @@ def run_baseline(n: int = 6, offset: int = 0, max_new_tokens: int = 320, tempera
 # --------------------------------------------------------------------------------------
 # L3 distillation: a chunked trainer that survives ZeroGPU preemption
 # --------------------------------------------------------------------------------------
-CKPT_DIR = os.path.join(HERE, "ckpt")
+# Checkpoints must live on the persistent volume.  `/app` is rebuilt from the repo on
+# every restart, so the earlier `HERE/ckpt` silently lost all progress (measured: the
+# step counter fell from 185 back to 6 after a restart).  `/data` is the Space's
+# bucket volume; fall back to a local dir only when it is not mounted.
+_PERSIST = "/data"
+CKPT_DIR = os.path.join(_PERSIST if os.path.isdir(_PERSIST) else HERE, "ckpt")
 
 DISTILL_STATE = {"step": 0, "history": [], "positions": 0, "started": None, "last_err": None}
 
@@ -765,7 +770,8 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
     h = DISTILL_STATE["history"]
     dt = time.perf_counter() - t0
     md = [f"### L3 distillation · chunk of {steps} steps in {dt:.0f}s",
-          f"- loss code: `targets.distill_kl` (spine-projected, single-T, shared denominator)",
+          f"- loss code: `targets.distill_kl` (support chosen at T=1, T^2 scaling)",
+          f"- checkpoint dir: `{CKPT_DIR}`{' (persistent)' if CKPT_DIR.startswith('/data') else ' ⚠️ NOT persistent — will be lost on restart'}",
           f"- resumed: {resumed_from or 'no (fresh start)'}",
           f"- **step {DISTILL_STATE['step']}** · {DISTILL_STATE['positions']:,} supervised positions total",
           f"- k={k} · T=2.0 · LoRA r=16 on Qwen3.5-0.8B · lr={lr:g}",

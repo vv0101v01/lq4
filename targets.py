@@ -139,64 +139,71 @@ def hard_target(token_ids: torch.Tensor, vocab: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------------------
 def build_T_target(fused_logp: torch.Tensor, k: int = 256, T: float = 2.0
                    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """(..., |V|) fused log-prob → (idx, val_T, tail_mass_T)。
+    """(..., |V|) fused log-prob -> (idx, val, tail) with the k set chosen at T=1.
 
-    為何要呢個：`train_distill.sparse_kl` 係「截斷後才降溫」，即
-      q_k = renormalise(π_k)        （只在 top-k 上）
-      q_T = soften(softmax(q_k), T) （再降溫）
-    咁樣做，**spine 外質量（10–18 %）會被靜靜哋重新分配**，T 越低影響越大。
-    正確次序係先降溫再截斷：
-      q_T = softmax(π / T)，val_T = q_T 在 top-k 上的 log，tail_mass_T = 1 − Σ val_T.exp()
-    學生只需要在 top-k 上擬合 val_T，剩下 tail_mass_T 留給「其餘 token」——
-    呢個 tail_mass_T 就係 `distill.py` 的 §3.3 方案 A/B 分野所在的質量。
+    **Why the k set is chosen at T=1, not at T.**  The naive order is
+    "softmax(pi/T) then top-k", but raising T flattens the law and the top-k then
+    covers almost nothing: measured on 42 207-token laws, the top 256 tokens hold
+    69.7 % of the mass at T=1 and only **15.9 % at T=2** (tail 0.84 nats).  Distilling
+    against that target would ask the student to reproduce a distribution whose
+    truncation is a guess.
+
+    Correct KD with a sparse support:
+
+        support = top-k(pi)                      # chosen once, at T=1
+        q       = renormalise(pi | support)      # teacher on the support
+        loss    = T^2 * KL(q || p_student|support)
+
+    `val` is the T=1 log-probability on the support (already renormalised), and
+    `tail` is the teacher mass the support leaves out — reported, never added to the
+    loss, because the loss is defined on the support the student is trained on.
     """
-    pi = fused_logp.float().exp()                    # 已是合法分佈
-    qT = torch.softmax(fused_logp.float() / float(T), dim=-1)
-    v, idx = torch.topk(qT, min(k, qT.shape[-1]), dim=-1)
-    tail = (1.0 - v.sum(-1)).clamp_min(0.0)
-    val = v.clamp_min(1e-12).log()
-    del pi
+    pi = fused_logp.float()
+    v, idx = torch.topk(pi, min(k, pi.shape[-1]), dim=-1)
+    val = torch.log_softmax(v, dim=-1)              # renormalised over the k tokens
+    tail = (1.0 - v.exp().sum(-1)).clamp_min(0.0)   # teacher mass outside the support
     return idx, val, tail
 
 
-# ---------------------------------------------------------------------------------------
-# 4. 自我測試
-# ---------------------------------------------------------------------------------------
 def distill_kl(student_logits: torch.Tensor, idxT: torch.Tensor, valT: torch.Tensor,
                spine_ids: torch.Tensor, T: float = 2.0, tail_mass: torch.Tensor | None = None,
                pos_weight: torch.Tensor | None = None) -> torch.Tensor:
     """T^2 * KL(q || p) on the k stored tokens — the loss the trainer uses.
 
-    Three separate bugs were found here by testing "does a perfect student score 0";
-    all three produced a floor that could never train away.  Each line below is
-    load-bearing:
+    Four separate bugs were found here by testing invariants a loss must satisfy;
+    each produced something that could never train away.  Every line is load-bearing:
 
     1. **Index spaces.** `idxT` indexes the *spine* (~42k entries, the only alphabet
        all four teachers share); the student indexes its own vocabulary (248k).
        `spine_gather` projects the student onto the spine first.  Gathering student
        log-probs with spine indices gave the 49-nat floor seen on the live Space.
-    2. **One temperature.** `valT` comes from `build_T_target`, which already
-       applied softmax(pi/T) before truncating.  Softening it again applies T twice
-       and a perfect student scores 3.14 nats at T=2.
-    3. **Same denominator.** The student must be normalised over the full spine and
-       then *sliced* to the k tokens, exactly like `valT` is a slice of a
-       full-support law.  Renormalising the student over the k tokens instead makes
-       the two laws disagree (0.132 nats at k=4/8) even when they are identical.
+    2. **One temperature.** `valT` comes from `build_T_target`, which already applied
+       softmax(pi/T).  Softening it again applies T twice; a perfect student scored
+       3.14 nats at T=2.
+    3. **Same denominator.** Both sides are renormalised over the SAME k tokens.
+       Mixing "slice of a full-support law" (teacher) with "distribution on k"
+       (student) makes the loss non-negative only by accident — measured: a student
+       *sharper* than its teacher scored **-0.97 nats**, which is impossible for a
+       KL and made the reported loss meaningless.
+    4. **The tail is a constant, not a penalty.** `tail_mass` is the teacher mass
+       outside the k tokens.  It is reported, never added to a loss that is already
+       renormalised over k — the old `+ T^2 * tail` double-counted it.
 
-    `tail_mass` is the teacher's mass outside the k tokens, added explicitly instead
-    of being redistributed over k: at k=256 §8.1 measured it at 2.98 % = 0.030 nats.
+    The truncated-vs-full gap is a real, documented bias (k=256 => 0.030 nats at
+    T=1, §8.1).  When T > 1 is used for training, the stored valT must be built at
+    that same T so the truncation covers as much mass as possible.
     """
     ki = idxT.long()
-    # student / T over the full spine, then slice — one temperature, full denominator
-    p = torch.log_softmax(spine_gather(student_logits, spine_ids) / T, dim=-1)
-    ps = p.gather(-1, ki)
-    # teacher: valT is already softmax(pi/T) sliced to k.  No second softening.
+    # student: over the full spine, then restricted and renormalised to the k tokens
+    p_full = torch.log_softmax(spine_gather(student_logits, spine_ids), dim=-1)
+    p = torch.log_softmax(p_full.gather(-1, ki), dim=-1)
+    # teacher: val is already renormalised over the same k tokens (build_T_target);
+    # renormalising again would be harmless but hides a wrong val, so do it once.
     q = valT.float()
-    kl = (q.exp() * (q - ps)).sum(-1)
+    kl = (q.exp() * (q - p)).sum(-1)
     if pos_weight is not None:
         kl = kl * pos_weight
-    out = (T * T) * kl
-    return out if tail_mass is None else out + (T * T) * tail_mass.to(out.device)
+    return (T * T) * kl
 
 
 def _selftest() -> None:
@@ -270,19 +277,38 @@ def _selftest() -> None:
     # idx 係排序後的，所以要 scatter 返去原本的 token 位置才比得
     back = torch.full_like(fp.exp(), -1.0).scatter(-1, i1, v1.exp())
     assert torch.allclose(back, fp.exp(), atol=1e-5)
-    # T>1 令分佈變平：top-1 機率下降，tail 隨 k 增加
+    # The support is chosen at T=1 — see build_T_target's docstring for why
+    # (softening first drops the top-k mass from 69.7 % to 15.9 % at T=2).
     i2, v2, t2 = build_T_target(fp, k=8, T=2.0)
-    assert (v2.exp()[..., 0].mean() < fp.exp().max(-1).values.mean()), "T=2 應該更平"
+    i1b, v1b, _ = build_T_target(fp, k=8, T=1.0)
+    assert torch.equal(i2, i1b), "T must not change which tokens are stored"
     assert (t2 > 0).all()
+    # ...and val is the T=1 law renormalised over those k tokens
+    vv, _ = torch.topk(fp, 8, dim=-1)
+    assert torch.allclose(v2, torch.log_softmax(vv, -1), atol=1e-6)
+    # k larger => smaller tail (monotone), which is the quantity the k decision uses
     i3, v3, t3 = build_T_target(fp, k=38, T=2.0)
     assert (t3.mean() < t2.mean()), "k 越大 tail 越小"
-    # 次序正確：先降溫再截斷 ⇒ val 必須等於 softmax(fp/T) 的 top-k（唔係 renormalise 之後再降溫）
-    qT = torch.softmax(fp / 2.0, -1)
-    vv, _ = torch.topk(qT, 8, dim=-1)
-    assert torch.allclose(v2.exp(), vv, atol=1e-6), "val 必須係 softmax(fp/T) 的 top-k"
+
+    # (i) THE regression that caught two live-training bugs (a negative loss and a
+    #     loss that did not vanish for a perfect student): every student must score
+    #     >= 0, and a student equal to the teacher must score exactly 0, for every
+    #     k and T actually used in training.
+    for _V, _k, _T in [(512, 64, 1.0), (512, 64, 2.0), (512, 256, 2.0), (64, 8, 0.5)]:
+        _lp = torch.log_softmax(torch.randn(3, _V) * 3, -1)
+        _ids = torch.arange(_V)
+        _i, _v, _t = build_T_target(_lp, k=_k, T=_T)
+        assert distill_kl(_lp, _i, _v, _ids, T=_T).max() < 1e-5, ("perfect", _k, _T)
+        _sharp = _lp.clone()
+        _sharp.scatter_add_(-1, _i, torch.full((3, _i.shape[-1]), 3.0))
+        for _name, _s in [("sharp", _sharp),
+                          ("random", torch.randn(3, _V) * 3),
+                          ("opposite", -_lp)]:
+            _kl = distill_kl(_s, _i, _v, _ids, T=_T)
+            assert _kl.min() >= -1e-5, (f"negative KL for {_name}", _k, _T, float(_kl.min()))
 
     print("targets selftest OK · sparse==dense · KL(student=teacher)=0 · NEG-safe · "
-          "support KL · hard target · top-k renormalised")
+          "support KL · hard target · top-k renormalised · no negative KL")
 
 
 if __name__ == "__main__":
