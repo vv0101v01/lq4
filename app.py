@@ -175,6 +175,26 @@ def _load_engine():
         return None
 
 
+def _teacher_stack(keep: list[str]):
+    """A TeacherStack over the teachers that survived `_select_teachers`.
+
+    `TeacherStack.model` is a plain dict copy, so evicting from `ENGINE` does not
+    shrink an already-built stack — the stack has to be built *after* eviction.
+    """
+    from teacher import TeacherStack
+    import teacher as _t
+
+    ts = TeacherStack.__new__(TeacherStack)
+    ts.specs, ts.order = ENGINE.specs, list(keep)
+    ts.tok = {n: ENGINE.tok[n] for n in keep}
+    ts.model = {n: ENGINE.model[n] for n in keep}
+    ts.stops = {n: ENGINE.stops[n] for n in keep}
+    ts.names, ts.spine = list(keep), ENGINE.spine
+    ts.dtype, ts.device = ENGINE.dtype, ENGINE.device
+    _t._TOK_OF.update(ENGINE.tok)
+    return ts
+
+
 def _ensure_teachers(want: list[str] | None = None, log=print) -> list[str]:
     """Make sure the requested teachers are resident, evicting any that are not.
 
@@ -789,6 +809,7 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
     keep, evicted = _select_teachers(ENGINE, teachers_n)
     if evicted:
         LOAD_LOG.append(f"♻️ evicted {evicted} → {_vram_free_gb():.1f} GB free")
+    teachers = _teacher_stack(keep)   # rebuild after eviction (models dict is a copy)
     s_tok = ENGINE.tok[keep[0]]
     student_tok, student = TD.build_student("Qwen/Qwen3.5-0.8B", "2fc0636", dtype=torch.bfloat16,
                                             device=str(ENGINE.device), log=lambda m: LOAD_LOG.append(m))
@@ -913,17 +934,9 @@ def evaluate_student(n: int = 8, offset: int = 0, k: int = 256, max_len: int = 5
     if evicted:
         LOAD_LOG.append(f"♻️ evicted {evicted} → {_vram_free_gb():.1f} GB free")
 
-    from teacher import TeacherStack, shared_offsets
-    import teacher as _t
+    from teacher import shared_offsets
 
-    teachers = TeacherStack.__new__(TeacherStack)
-    teachers.specs, teachers.order = ENGINE.specs, keep
-    teachers.tok = {n_: ENGINE.tok[n_] for n_ in keep}
-    teachers.model = {n_: ENGINE.model[n_] for n_ in keep}
-    teachers.stops = {n_: ENGINE.stops[n_] for n_ in keep}
-    teachers.names, teachers.spine = keep, ENGINE.spine
-    teachers.dtype, teachers.device = ENGINE.dtype, ENGINE.device
-    _t._TOK_OF.update(ENGINE.tok)
+    teachers = _teacher_stack(keep)
 
     rows = corpus_rows(TEST_PATH) if offset_test else corpus_rows()
     lo = max(0, int(offset))
