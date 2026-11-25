@@ -694,8 +694,8 @@ def _distill_rows(limit=None):
 
 
 @spaces.GPU(duration=280)
-def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 768, limit: int = 40,
-                 fresh: bool = False, teachers_n: int = 2):
+def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 768, limit: int = 1200,
+                 fresh: bool = False, teachers_n: int = 2, seed: int = 0):
     """One chunk of LoRA distillation.  Safe to call repeatedly: resumes from ckpt."""
     import gc
 
@@ -705,7 +705,7 @@ def distill_step(steps: int = 4, k: int = 256, lr: float = 1e-4, max_len: int = 
     t0 = time.perf_counter()
     if ENGINE is None:
         raise gr.Error("models failed to load — see Diagnostics")
-    rows = _distill_rows(limit)
+    rows = _distill_rows(limit if limit and limit > 0 else None)
     if fresh:
         for f in glob.glob(os.path.join(CKPT_DIR, "step_*.pt")):
             os.remove(f)
@@ -1126,7 +1126,7 @@ with gr.Blocks(title="6in1") as demo:
                 ds_k = gr.Dropdown([64, 128, 256], value=256, label="top-k")
                 ds_lr = gr.Slider(1e-5, 5e-4, value=1e-4, step=1e-5, label="learning rate")
                 ds_max = gr.Slider(256, 2048, value=768, step=64, label="max tokens")
-                ds_lim = gr.Slider(10, 500, value=40, step=10, label="rows to sample from")
+                ds_lim = gr.Slider(0, 7500, value=1200, step=50, label="rows to sample from (0 = all)")
                 ds_tn = gr.Slider(2, 4, value=2, step=1, label="teachers used")
                 ds_fresh = gr.Checkbox(value=False, label="restart from scratch")
             with gr.Row():
