@@ -533,14 +533,13 @@ def _dynamics(w_ring, w_knn, emb, steps=200):
     x0 = graph.pca2(emb)
     rows = []
     for name, w in (("ring", w_ring), ("LFM k-NN", w_knn)):
-        # The ring is circulant, so its diffusion is a cyclic convolution and can go
-        # through the FFT path; the k-NN graph is NOT circulant and must stay on the
-        # general matmul.  dispatching per graph rather than per call is the point.
-        if name == "ring":
-            d, backend = graph.diffuse_fft(w, x0, steps)
-            LOAD_LOG.append(f"🔁 ring diffusion backend: {backend}")
-        else:
-            d = graph.diffuse(w, x0, steps)
+        # DELIBERATELY on the matmul path.  The FFT kernel is mathematically verified
+        # (diffuse_fft == diffuse to 1e-16) but on CPU it is 2-8x SLOWER: at N<=128
+        # three transforms of bookkeeping lose to 64-16384 FMAs.  Wiring it in while
+        # the speedup is negative would be a regression dressed as an optimisation.
+        # Flip this to graph.diffuse_fft once bench/gpu_bench.py has produced a real
+        # T4 number; the adapter and its tests are already in place for that.
+        d = graph.diffuse(w, x0, steps)
         r = graph.kuramoto(w, steps)
         rows += [dict(step=t, value=float(d[t] / d[0]), series=f"{name} · concept dispersion") for t in range(steps + 1)]
         rows += [dict(step=t, value=float(r[t]), series=f"{name} · Kuramoto R") for t in range(steps + 1)]
