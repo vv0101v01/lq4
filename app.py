@@ -967,6 +967,63 @@ def _vram_report() -> str:
 REPORT_DIR = os.path.join(_PERSIST if os.path.isdir(_PERSIST) else HERE, "reports")
 
 
+@spaces.GPU(duration=300)
+def run_answer_mix_trial():
+    """Two isolated 36-step branches from the current disk checkpoint, no promotion."""
+    import experiment_answer_mix as exp
+    import train_distill as TD
+    import traceback as _tb
+
+    if ENGINE is None:
+        return "ERROR: model engine unavailable"
+    ck = TD.latest_ckpt(CKPT_DIR)
+    if not ck:
+        return "ERROR: no persistent checkpoint to branch from"
+    train_rows, test_rows = corpus_rows(), corpus_rows(TEST_PATH)
+    if not train_rows or not test_rows:
+        return "ERROR: training or held-out corpus is missing"
+    keep, _ = _select_teachers(ENGINE, 2)
+    if len(keep) != 2:
+        return f"ERROR: expected two teachers, got {keep}"
+    teachers = _teacher_stack(keep)
+    tok, student, opt = _get_student(keep, 2e-4)
+    # This trial temporarily uses the worker's model; restore it even on errors.
+    try:
+        path, report = exp.run(teachers, tok, student, train_rows, test_rows, ck,
+                               os.path.join(_PERSIST, "experiments"), steps=36, answer_weight=0.05)
+        initial = report['initial']
+        lines = [f"Paired experiment: {path}",
+                 f"Source: {report['checkpoint']} (step {report['base_step']})",
+                 f"Teachers: {', '.join(report['teachers'])}",
+                 f"Train rows: {report['training_rows']} (excluded duplicates: {report['excluded_train_duplicates']})",
+                 f"Held-out test: {initial['rows']} rows, {initial['positions']} positions",
+                 f"Initial: KL {initial['kl']:.4f}, top-1 {initial['top1']:.2f}%"]
+        for name, item in report['variants'].items():
+            score=item['evaluation']
+            lines.append(f"{name}: {item['steps_done']} steps, KL {score['kl']:.4f}, top-1 {score['top1']:.2f}%, checkpoint {item['checkpoint']}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"EXPERIMENT FAILED: {type(exc).__name__}: {exc}\n{_tb.format_exc()[-3000:]}"
+    finally:
+        # Also restore cached optimizer state: other endpoints share this worker.
+        step, _ = TD.load_ckpt(ck, student, opt)
+        STUDENT['step'] = step
+
+
+@spaces.GPU(duration=120)
+def verify_radix8_cuda():
+    """Run device-code correctness tests; does not touch student checkpoints."""
+    import importlib.util
+    path = os.path.join(HERE, "fft_ring", "verify", "gpu_verify.py")
+    try:
+        spec = importlib.util.spec_from_file_location("radix8_gpu_verify", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.verify()
+    except Exception as exc:
+        return f"CUDA verification FAILED: {type(exc).__name__}: {exc}"
+
+
 @spaces.GPU(duration=180)
 def fft_ring_bench(steps: int = 200, batch: int = 64, reps: int = 20):
     """Real GPU numbers: FFT cyclic convolution vs the matmul it replaces.
@@ -1392,6 +1449,12 @@ with gr.Blocks(title="6in1") as demo:
             fr_btn = gr.Button("FFT ring bench (real GPU numbers)", variant="secondary")
             fr_md = gr.Markdown()
             fr_btn.click(fft_ring_bench, [fr_steps, fr_batch, fr_reps], [fr_md])
+            trial_btn = gr.Button("Paired answer-loss trial (36 steps each, answer weight 0.05)", variant="secondary")
+            trial_result = gr.Textbox(label="Paired trial result", lines=8)
+            trial_btn.click(run_answer_mix_trial, [], [trial_result])
+            radix_btn = gr.Button("Verify radix-8 CUDA correctness", variant="secondary")
+            radix_result = gr.Textbox(label="Radix-8 CUDA verification", lines=7)
+            radix_btn.click(verify_radix8_cuda, [], [radix_result])
             vd_btn = gr.Button("VRAM diagnostic (what is resident?)", variant="secondary")
             vd_md = gr.Markdown()
             vd_btn.click(vram_diag, [], [vd_md])

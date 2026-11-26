@@ -167,8 +167,10 @@ def latest_ckpt(out_dir: str) -> str | None:
 def train_student(teachers, spine, student_tok, student, rows, steps: int, k: int = 256, T: float = 2.0,
                   lr: float = 1e-4, bs: int = 1, max_len: int = 1024, weights: dict | None = None,
                   out_dir: str = "ckpt", save_every: int = 50, start_step: int = 0, log=print,
-                  js_weight: float = 0.0):
-    """One chunk of distillation.  Returns (steps_done, loss history)."""
+                  js_weight: float = 0.0, answer_weight: float = 0.0):
+    """One chunk of distillation. Answer supervision is experimental and opt-in."""
+    if not 0 <= answer_weight <= 1:
+        raise ValueError("answer_weight must be between 0 and 1")
     weights = weights or {n: 1.0 for n in teachers.names}
     opt = torch.optim.AdamW([p for p in student.parameters() if p.requires_grad], lr=lr, betas=(0.9, 0.95))
     os.makedirs(out_dir, exist_ok=True)
@@ -177,6 +179,10 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
         s, info = load_ckpt(ck, student, opt)
         start_step = s
         log(f"resumed {ck} at step {s} ({info})")
+    # Loading Adam state also restores its old parameter-group learning rate.
+    # Honour this call's explicit lr for both resumed and fresh runs.
+    for group in opt.param_groups:
+        group["lr"] = lr
 
     hist = []
     student.train()
@@ -242,11 +248,21 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
             # backward; measured 7.5 GB of activations on a 14.74 GiB card, which is
             # what actually OOMed — the teachers only account for 5.4 GB.
             logits = out.logits[0][si]                        # (n, V_student) — grad kept
+            answer_loss = None
+            if answer_weight:
+                from experimental_answer_loss import answer_cross_entropy
+                offsets = enc["offset_mapping"][0].tolist()
+                answer_loss, _ = answer_cross_entropy(out.logits[0], ids[0], offsets,
+                                                     len(_prompt_of(r)))
             del out
             tgt = torch.from_numpy(fused[b]).to(logits.device)[tj]   # (n, |V|) log-probs
             ki, kv, tail = build_T_target(tgt, k=min(k, tgt.shape[-1]), T=T)
             spine_ids = torch.as_tensor(_spine_ids(teachers), dtype=torch.long, device=logits.device)
-            loss_terms.append(distill_kl(logits, ki, kv, spine_ids, T=T))
+            kl_loss = distill_kl(logits, ki, kv, spine_ids, T=T)
+            if answer_weight:
+                from experimental_answer_loss import mixed_loss
+                kl_loss = mixed_loss(kl_loss, answer_loss, answer_weight)
+            loss_terms.append(kl_loss)
             npos += len(pairs)
         if not loss_terms:
             log(f"step {step}: no aligned positions, skipped")
@@ -256,12 +272,12 @@ def train_student(teachers, spine, student_tok, student, rows, steps: int, k: in
         loss.backward()
         torch.nn.utils.clip_grad_norm_([p for p in student.parameters() if p.requires_grad], 1.0)
         opt.step()
-        hist.append((step, float(loss), npos))
+        hist.append((step, float(loss.detach()), npos))
         el = time.perf_counter() - t0
-        log(f"step {step}: loss {float(loss):.4f} · {npos} pos · {el:.1f}s elapsed")
+        log(f"step {step}: loss {float(loss.detach()):.4f} · {npos} pos · {el:.1f}s elapsed")
         if (step + 1 - start_step) % save_every == 0:
             save_ckpt(os.path.join(out_dir, f"step_{step + 1}.pt"), student, opt, step + 1,
-                      {"k": k, "T": T, "lr": lr, "n": len(rows)})
+                      {"k": k, "T": T, "lr": lr, "n": len(rows), "answer_weight": answer_weight})
     return hist
 
 
